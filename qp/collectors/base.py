@@ -12,15 +12,37 @@ external reference only). Original implementations; no code copied.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
 class CollectorError(Exception):
     """Credential detection or API polling failure (user-facing)."""
+
+
+def credential(name: str) -> str:
+    """Resolve a credential: environment first, then ~/.qpool/credentials.json.
+
+    The credentials file lives outside the repo (like the ledger and plugin
+    collectors), so secrets never touch the git tree:
+        ~/.qpool/credentials.json  ->  {"ARK_API_KEY": "...", ...}
+    """
+    value = (os.environ.get(name) or "").strip()
+    if value:
+        return value
+    path = Path.home() / ".qpool" / "credentials.json"
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return (data.get(name) or "").strip()
+    return ""
 
 
 @dataclass

@@ -25,12 +25,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse
 
-from .base import CollectorError, QuotaReading, http_json
+from .base import CollectorError, QuotaReading, credential, http_json
 
 AGENT = "doubao"
 CAPABILITY_TIER = 3
@@ -43,15 +42,15 @@ VERSION = "2024-01-01"
 
 
 def detect_credentials() -> Optional[Dict[str, Any]]:
-    ak = (os.environ.get("VOLC_ACCESS_KEY_ID") or "").strip()
-    sk = (os.environ.get("VOLC_SECRET_ACCESS_KEY") or "").strip()
+    ak = credential("VOLC_ACCESS_KEY_ID")
+    sk = credential("VOLC_SECRET_ACCESS_KEY")
     if not ak or not sk:
         return None
     return {
         "access_key": ak,
         "secret_key": sk,
-        "api_key_id": (os.environ.get("ARK_API_KEY_ID") or "").strip() or None,
-        "source": "VOLC_ACCESS_KEY_ID/VOLC_SECRET_ACCESS_KEY env",
+        "api_key_id": credential("ARK_API_KEY_ID") or None,
+        "source": "env or ~/.qpool/credentials.json",
     }
 
 

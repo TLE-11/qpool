@@ -473,10 +473,11 @@ def cmd_quota_cpa(db: Database, args: argparse.Namespace) -> None:
             if not key_env:
                 print("error: --api-key-env is required", file=sys.stderr)
                 sys.exit(1)
-            api_key = (os.environ.get(key_env) or "").strip()
+            from .collectors.base import credential
+            api_key = credential(key_env)
             if not api_key:
-                print(f"error: env {key_env} is empty; export your API key first",
-                      file=sys.stderr)
+                print(f"error: {key_env} not found; export it or add it to "
+                      f"~/.qpool/credentials.json", file=sys.stderr)
                 sys.exit(1)
             models: List[dict] = []
             for m in args.model:
