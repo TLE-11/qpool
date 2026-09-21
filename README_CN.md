@@ -2,105 +2,13 @@
 
 [English](README.md) | 中文
 
-**多编码 Agent 的「配额池化 + 成本感知路由」控制平面。**
+**多编码 Agent 的配额池化 + 成本感知路由控制平面——先烧你已经付过钱的额度，再碰按量计费的 API。**
 
-你各家编码 Agent 的订阅费早就付了。qpool 把散落各处的订阅额度、额度包、按量账户聚合成一个配额池，在**能力满足任务**的前提下按**边际成本从低到高**自动路由——**已付费的订阅额度（边际成本≈0）优先消耗、快过期的额度包在过期前用完、按量付费只在必要时才动用。**
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python ≥ 3.9](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](pyproject.toml)
+[![dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](pyproject.toml)
 
-省 token 的本质不是少用，而是**把本来要走按量付费的任务，挪到已经付过钱的订阅额度上**。
-
-```
-订阅额度（已付费，≈$0） →  额度包（临期优先消耗）  →  按量付费（真花钱）
-      优先消耗                 过期前用完                 最后兜底
-```
-
-## 为什么做
-
-| 痛点 | 现状 |
-| --- | --- |
-| 订阅额度不用白不用 | Cursor/Kiro/Codex 月费已付，额度散落各处无人统一调度 |
-| 配额信息割裂 | 每个 agent 一个 dashboard，余额/模型/进度要登录 N 个地方看 |
-| 按量 API 真花钱 | 默认路径容易被高频任务烧掉，却没有成本意识 |
-| 额度包会过期 | 赠送/购买的额度包过期作废，无人提醒、无人自动消耗 |
-| 能力与价格脱节 | 便宜的不一定够用，贵的不一定更强，路由必须在「干得了」的子集里选最便宜的 |
-
-## 架构
-
-qpool 是**控制平面**，刻意不重造透传网关——那是
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的活，qpool 通过它的
-Management API 驱动它。
-
-```
-┌─ 采集层（11 家真实 API + manual 通道 + 插件目录）
-│     codex · claude-code · cursor · gemini · copilot · kimi
-│     cline · grok(xAI mgmt) · 豆包(ark) · windsurf · devin
-│         │  qpool quota sync --apply
-│         ▼
-│   ┌───────────────────────────────────────────────┐
-│   │ 配额台账（SQLite）                              │
-│   │  条目：类型/总量/剩余/过期/单价/能力档位          │
-│   │  事件：只追加的用量流水（事件溯源）               │
-│   └───────────────────────────────────────────────┘
-│         │ route_sort_key（边际成本排序）
-│         ▼
-│   控制面 conductor：对账 → 启停 + priority + fill-first
-│         │  Management API（localhost:8317/v0/management）
-└─────────┤
-          ▼
-   CLIProxyAPI —— 协议转换 + 多账号池（不重造）
-          │  ANTHROPIC_BASE_URL / OPENAI_BASE_URL
-          ▼
-   Claude Code · Codex CLI · 任意兼容 harness
-          │  每请求 token 经 usage-queue 回流
-          ▼
-   任务级记账 → 月度节省报表（闭环）
-```
-
-## 功能
-
-- **配额台账**——所有 agent × 账号统一一张表：类型（订阅/额度包/按量）、剩余量、过期时间、单位成本、能力档位。账期惰性滚动重置，用量事件只追加（事件溯源）。
-- **11 家真实采集器**——用本机 CLI 已登录的凭据（OAuth 文件、系统钥匙串、应用状态库）直接调厂商配额 API，无需重新登录。
-- **成本感知路由**——先能力硬约束过滤，再按边际成本排序：剩余多的订阅优先 → 最快过期的额度包优先 → 最便宜的按量 API 兜底。
-- **路由模拟**——提交任务前先算**三笔账**：路由成本 vs 纯按量成本 vs 池化节省，附 failover 链路和每条候选被跳过的原因。
-- **CLIProxyAPI 控制面**——对账循环把决策下发到网关：禁用耗尽的凭据、恢复已重置的凭据、写入 priority 字段、设置 `fill-first`，让整个池子按"最便宜优先"的顺序消耗。
-- **任务级记账**——从网关的 per-request 用量队列回填台账；月报展示真实支出、池化用量的按量等价价值、以及**池化净省**。
-- **Daemon**——`sync → reconcile → pull-usage` 定时循环，单实例锁防双开；`--once` 适配 cron/launchd。
-- **插件采集器**——公司内部/私有 agent 放 `~/.qpool/collectors/`，不进本仓库（见下文）。
-
-## 安装
-
-要求 Python ≥ 3.9，零第三方依赖。
-
-```bash
-git clone <你的 fork 地址> qpool && cd qpool
-python3.11 -m venv ~/.local/share/qpool/venv
-~/.local/share/qpool/venv/bin/pip install -e .
-mkdir -p ~/.local/bin
-ln -sf ~/.local/share/qpool/venv/bin/qpool ~/.local/bin/qpool   # 确保在 PATH 里
-
-qpool quota list
-```
-
-## 快速开始
-
-**1. 手工录入额度**
-
-```bash
-qpool quota add --agent codex --account work --kind subscription \
-    --total 500 --unit requests --reset monthly --capability 4
-qpool quota add --agent claude-code --account main --kind credit_pack \
-    --total 1000000 --unit tokens --expires 2026-10-01 --capability 5
-qpool quota add --agent kimi-cli --account main --kind payg \
-    --cost-per-unit 0.000002 --unit tokens
-```
-
-**2. 或者直接从厂商 API 同步真实读数**（自动探测本机 CLI 凭据；不加 `--apply` 时只是演练）：
-
-```bash
-qpool quota sync            # 看看各家采集器都能读到什么
-qpool quota sync --apply    # 读数写入台账
-```
-
-**3. 提交任务前先模拟**——三笔账：
+每个编码 Agent 都在默不作声地先烧你最贵的额度。qpool 把这件事反过来：把你散落在各家 CLI/IDE 的订阅额度、额度包、按量账户聚合进一个台账，然后把每个任务路由给**干得了这个活、且最便宜**的那个入口。
 
 ```bash
 $ qpool quota simulate --amount 500000 --unit tokens --tier 3
@@ -111,132 +19,142 @@ route plan for 500,000 tokens, capability >= T3:
   FALLBACK  #3 kimi-cli/main payg            T3  metered          est $1
 
 the three bills:
-  routed cost   : $0
-  payg-only     : $1
-  saved by pool : $1
+  routed cost   : $0      # qpool 路由后的成本
+  payg-only     : $1      # 默认路径的成本
+  saved by pool : $1      # ← 整个项目的意义就在这一行
 ```
 
-**4. 接入 CLIProxyAPI（透传数据面）**
+省 token 的本质不是少用，而是**把本来要走按量付费的任务，挪到已经付过钱的订阅额度上**。
+
+## 为什么做
+
+- Cursor/Kiro/Codex 的订阅是**沉没成本**——月底用不完的额度，钱照样烧掉。
+- 额度包是**折旧资产**——过不过期它都在贬值，到期直接归零。
+- 按量 API 是**真实边际支出**——而默认路径偏偏先烧它，因为没有任何一个 dashboard 能看到全局。
+
+没有人按**边际成本**路由。市面上的路由按限流、按任务类型、按 round-robin 分，就是没人按"哪个入口此刻对我来说不要钱"分。
+
+## 30 秒看懂架构
+
+qpool 是**控制平面**，刻意不重造透传网关——那是
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 已经做到极致的事，qpool 通过它的 Management API 驱动它。
+
+```
+采集层：11 家真实配额 API（codex, claude, cursor, gemini, copilot, kimi,
+        cline, grok/xAI, 豆包/ark, windsurf, devin）+ manual 通道 + 插件目录
+      │  qpool quota sync --apply
+      ▼
+┌─ 配额台账（SQLite）─────────────────────────────────┐
+│  条目：类型 / 剩余 / 过期 / 单价 / 能力档位            │
+│  事件：只追加的用量流水（事件溯源）                    │
+└──────────────────────────────────────────────────────┘
+      │  route_sort_key：能力硬约束 → 边际成本全序
+      ▼
+控制面 conductor：对账 → 启停 + priority + fill-first
+      │  Management API（CLIProxyAPI :8317）
+      ▼
+CLIProxyAPI —— 协议转换 + 多账号池（不重造）
+      │  ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+      ▼
+Claude Code · Codex CLI · 任意兼容 harness
+      │  每请求 token 经 usage-queue 回流
+      ▼
+任务级记账 → 月度「池化净省」报表
+```
+
+## 快速上手（3 分钟）
+
+Python ≥ 3.9，**零第三方依赖**。
 
 ```bash
-export QPOOL_CPA_KEY=<CLIProxyAPI 配置里的 remote-management.secret-key>
+pip install -e . && qpool quota list
 
-qpool quota cpa status              # 凭据池 × 台账对账视图（含建议动作）
-qpool quota cpa reconcile --apply   # 下发 启停 + priority + fill-first
-qpool quota cpa pull-usage          # 每请求 token 回填台账
+# 手工录入……
+qpool quota add --agent codex --account work --kind subscription \
+    --total 500 --unit requests --reset monthly --capability 4
+
+# ……或者用本机 CLI 已登录的凭据直接调厂商配额 API
+qpool quota sync --apply
+
+# 提交任务前先算三笔账
+qpool quota simulate --amount 500000 --unit tokens --tier 3
+
+# 接入真实网关（可选但推荐）
+export QPOOL_CPA_KEY=<CLIProxyAPI 的 remote-management.secret-key>
+qpool quota cpa reconcile --apply   # 把成本顺序下发到账号池
+qpool quota daemon                  # 每 60s：sync → reconcile → pull-usage
+
+# 月底
+qpool quota report                  # 真实支出 vs 池化净省
 ```
 
-标准 OpenAI 兼容 provider（如豆包/方舟）完全不需要 OAuth 透传——直接注册为网关上游：
+## 设计取舍
 
-```bash
-export ARK_API_KEY=...
-qpool quota cpa register-provider --name doubao --preset ark \
-    --model doubao-seed-2-1-pro-260628:doubao-pro
-# Agent Plan / Coding Plan 用户：加 --plan（自动切到 /api/plan/v3）
-# 用 qpool quota cpa providers 验证
-```
+**这部分最值得一读。** 每条都是：候选方案 → 我的选择 → 为什么。
 
-**5. 跑控制循环**
+### 1. 控制面，而不是再造一个网关
 
-```bash
-qpool quota daemon                # 每 60s：sync → reconcile → pull-usage
-qpool quota daemon --once         # 跑一轮退出，适合 cron/launchd
-```
+**选项**：(a) 自研 OAuth 透传、协议转换、多账号轮询的完整网关；(b) 把网关当作已解决的问题，只做决策层。
 
-**6. 看这个月池化省了多少**
+**选 (b)。** 协议透传是 CLIProxyAPI 已经推到生产级成熟的commodity——OAuth 流程、四种线协议、冷却、多账号轮换，重写要几个月且永远追不上。qpool 不可替代的价值在**成本感知决策**，而 CLIProxyAPI 的 Management API 经验证是读写双全的（`auth-files` 启停、`priority`、`routing/strategy`、`reset-quota`、`usage-queue`），这让分工真正成立而不是口号。我用的判断原则：**把拥有差异化的那一层握在手里，其余全部集成。**
 
-```bash
-qpool quota report
-#   real money spent (payg)       : $0.24
-#   pooled usage, payg-equivalent : $1
-#   saved by pooling              : $1
-```
+### 2. 边际成本全序，而不是加权路由
+
+**选项**：(a) round-robin；(b) 按价格加权随机；(c) 按边际成本做严格全序。
+
+**选 (c)。** 三类额度在经济学上是**不同的物种**，不是同一物种的不同权重：订阅是沉没成本（边际成本 0，按月再生）、额度包是折旧资产（价值随到期日坍缩到 0）、按量是真实边际支出。这是**排序问题，不是概率问题**——所以 qpool 计算全序（剩余多的订阅 → 最快过期的额度包 → 单价最低的按量），并以 `fill-first` + priority 下发到网关，而不是把流量按比例撒在池子上。
+
+### 3. 一张统一台账表，而不是 per-provider schema
+
+参考项目 onWatch 给**每家 provider 建三张表——16 家 40+ 张表**，接新厂商就要改 schema。qpool 只用一张 `quota_entries` 表（`agent` 是列不是表名），一个 `window_key` 列容纳一家多窗口（Codex 的 5h/7d/credits 共存为多行）。接新厂商是加一行，不是加一套表。**批判性地研究现有项目**——吸收它的重置周期检测思路、拒绝它的数据模型——比照抄有用得多。
+
+### 4. 事件溯源，以及两条刻意不同严格度的写入路径
+
+用量是**只追加的事件流**，从不是就地更新：可审计、可回放、可对账。在此之上，两条写入路径的严格度刻意不同：手工 `consume` 是严格模式（不允许透支、不允许消耗过期额度——这是**约束**），而网关回填是 `force` 模式（消费已在上游发生——这是**事实**）。把事实记到零以下会得到负的 `remaining`——**超用是真实的信号，不是需要压制错误**。
+
+### 5. 对 Fair Use 订阅做诚实建模
+
+订阅 API 只报 `used_percent`，不报绝对量——绝对配额根本不存在（这正是 Fair Use 的含义）。qpool 不编造数字：百分比型条目显示 `38% left`（`total = NULL`）；用户手工估了 total，sync 就按百分比**校准** `remaining = total × (1 − used%)`。**承认自己不知道什么的模型，胜过看起来精确的虚构。**
+
+### 6. 零依赖，哪怕更费劲
+
+只用标准库（`sqlite3`、`argparse`、`urllib`、`hmac`）——火山引擎签名 V4 手写，不引厂商 SDK。安装以秒计，Python ≥ 3.9 到处能跑，供应链暴露面只有标准库。
+
+### 7. 开源合规是功能，不是事后补救
+
+私有采集器（公司内部 agent）放 `~/.qpool/collectors/`——**仓库之外**的插件目录，内部逻辑永远碰不到公开代码树。GPL 参考项目仅作外部参考（思路与可公开观察的 API 事实，零代码拷贝），完整声明见 [NOTICE](NOTICE)。
+
+## 工程细节
+
+- **惰性重置取代后台轮询**——CLI 工具不该依赖常驻进程才能保持正确；重置检测在读写时惰性发生（恰好在需要时），跨周期用周期运算追平。
+- **transcript 解析按 message.id 去重**——编码 Agent 的会话文件会把同一消息重写多遍（流式、重试），聚合时按 message.id 去重并保留最终态（与 ccusage 同规则），这把一个真实月度估算从虚高的 $715 修正到正确的 ~$350。
+- **消耗型与余额型两种遥测**——计量类 API（方舟、Devin）报的是消耗量而非余额；台账接受 `consumed_abs` 并推导 `remaining = total − consumed`。
+
+## 测试
+
+CI 里没有真实厂商账号，所以全部集成用本地 mock server 重放文档线协议验证：约 30 项断言覆盖凭据探测、签名 V4 请求构造、响应解析（含字符串数值与嵌套负载）、台账 upsert 幂等、滚动窗口重置、对账决策、priority 编排与用量回填语义。
 
 ## 采集器覆盖
 
-| Agent | 凭据来源 | 配额 API | 备注 |
-| --- | --- | --- | --- |
-| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` | 5h + 7d 双窗口 + credits |
-| Claude Code | macOS 钥匙串 → `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` | OAuth beta 头 |
-| Cursor | `state.vscdb` ItemTable（只读） | `api2.cursor.sh` Connect-RPC | 顺带读 email/套餐 |
-| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | pro/flash 族聚合 |
-| Copilot | `COPILOT_TOKEN` / IDE hosts.json | `api.github.com/copilot_internal/user` | 免费版新格式归一化 |
-| Kimi CLI | `~/.kimi-code/credentials/` | `api.kimi.com/coding/v1/usages` | 兼容字符串数值 |
-| Cline | `CLINE_API_KEY` | `api.cline.bot/api/v1/users/{id}/balance` | 官方 REST |
-| Grok / xAI | `XAI_MANAGEMENT_KEY` + `XAI_TEAM_ID` | `management-api.x.ai/.../invoice/preview` | 替代 gRPC-web 逆向 |
-| 豆包 / 方舟 | `VOLC_ACCESS_KEY_ID` + `VOLC_SECRET_ACCESS_KEY` | `GetInferenceUsage`（签名 V4） | 月度消耗 |
-| Windsurf | `WINDSURF_SERVICE_KEY` | `server.codeium.com/api/v1/GetTeamCreditBalance` | 企业版 |
-| Devin | `DEVIN_API_KEY` | `api.devin.ai/v3/.../consumption/daily` | 企业版，ACU 单位 |
-| 其余全部 | `~/.qpool/static_quotas.json` | — | manual 通道（kiro、antigravity、qoder、opencode……） |
-| 内部 agent | `~/.qpool/collectors/*.py` | 你的 API | 插件目录，不进仓库 |
-
-## 命令参考
-
-```
-qpool quota add        录入额度条目（订阅/额度包/按量）
-qpool quota list       台账视图（默认按边际成本路由顺序）
-qpool quota consume    手工记账（严格校验：不允许透支）
-qpool quota remove     删除条目及其用量事件
-qpool quota events     只追加的用量历史
-qpool quota simulate   路由演练：三笔账 + failover 链
-qpool quota report     月度用量 + 节省报表
-qpool quota sync       用本机凭据轮询厂商 API（--apply 写入台账）
-qpool quota cpa        CLIProxyAPI 控制面：status/reconcile/pull-usage
-qpool quota daemon     控制循环：sync -> reconcile -> pull-usage
-```
-
-## 配置
-
-| 环境变量 | 用途 |
-| --- | --- |
-| `QPOOL_DB` | 台账路径（默认 `~/.qpool/qpool.db`） |
-| `QPOOL_CPA_URL` | CLIProxyAPI 地址（默认 `http://localhost:8317`） |
-| `QPOOL_CPA_KEY` | CLIProxyAPI 管理密钥（`remote-management.secret-key`） |
-| `QPOOL_STATIC_QUOTAS` | manual 通道 JSON 路径 |
-| `QPOOL_COLLECTORS_DIR` | 插件采集器目录（默认 `~/.qpool/collectors`） |
-| `CODEX_HOME`、`KIMI_CODE_HOME`、`COPILOT_TOKEN`、`GEMINI_TOKEN`、`CLINE_API_KEY`、`XAI_MANAGEMENT_KEY`、`XAI_TEAM_ID`、`VOLC_ACCESS_KEY_ID`、`VOLC_SECRET_ACCESS_KEY`、`ARK_API_KEY_ID`、`WINDSURF_SERVICE_KEY`、`DEVIN_API_KEY` | 各采集器凭据 |
-
-## 插件采集器
-
-公司内部或私有 agent 不属于本仓库。在 `~/.qpool/collectors/` 放一个 Python 文件，暴露三个符号即可加入注册表：
-
-```python
-# ~/.qpool/collectors/acme-agent.py
-from qp.collectors.base import QuotaReading
-
-AGENT = "acme-agent"
-
-def detect_credentials():
-    return {"access_token": "...", "source": "internal"}
-
-def fetch_readings(creds):
-    return [QuotaReading(agent="acme-agent", window_key="daily",
-                         label="acme-agent (internal)", used_percent=33.0)]
-```
-
-然后 `qpool quota sync --agent acme-agent --apply` 就会走与内置采集器完全相同的管道。
-
-## 路由原理
-
-1. **能力硬约束**——条目的 `capability_tier` 必须 ≥ 任务需求（`--tier`），且额度单位必须匹配（tokens 任务不能花 requests 额度）。
-2. **边际成本排序**——订阅优先（已付费，剩余多者先）、额度包次之（最快过期者先，过期前榨干）、按量最后（单价低者先）。过期/耗尽的条目永远垫底。
-3. **网关编排**——这个顺序会被翻译成 CLIProxyAPI 的 `priority` 字段 + `fill-first` 策略，池子严格按"最便宜优先"消耗；耗尽的凭据被禁用，恢复的凭据被启用并 `reset-quota`。
-
-## ToS 风险说明
-
-轮询自己的配额（qpool 采集器做的事）是**只读**行为。**通过透传网关消费订阅额度是另一回事**——Google 明确禁止把 AI Pro 订阅用于 API 调用；其他厂商属于未执法的灰色地带。这个风险在透传层（CLIProxyAPI 及其同类），不在本控制面。请了解各厂商条款；qpool 只负责把账算清楚、把路由摆明白。
+| Agent | 凭据 | 配额 API |
+| --- | --- | --- |
+| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage`（5h+7d 窗口） |
+| Claude Code | macOS 钥匙串 / `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
+| Cursor | `state.vscdb`（只读） | `api2.cursor.sh` Connect-RPC |
+| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Copilot | `COPILOT_TOKEN` / IDE hosts.json | `api.github.com/copilot_internal/user` |
+| Kimi CLI | `~/.kimi-code/credentials/` | `api.kimi.com/coding/v1/usages` |
+| Cline | `CLINE_API_KEY` | `api.cline.bot`（官方 REST） |
+| Grok / xAI | `XAI_MANAGEMENT_KEY` | `management-api.x.ai` billing |
+| 豆包 / 方舟 | 火山 AK/SK | `GetInferenceUsage`（签名 V4） |
+| Windsurf / Devin | service key | `server.codeium.com` / `api.devin.ai/v3`（企业版） |
+| 其余全部 | `~/.qpool/static_quotas.json` | manual 通道 |
+| 内部 agent | `~/.qpool/collectors/*.py` | 仓库外插件 |
 
 ## 致谢
 
-qpool 是原创实现——本仓库不拷贝任何第三方代码。设计思路与可公开观察的功能事实（API 端点、凭据位置）受益于：
-
-- [onWatch](https://github.com/onllm-dev/onWatch)（**GPL-3.0**）——配额轮询与重置周期检测思路。仅作**外部参考**；未包含、未拷贝、未链接，构建运行 qpool 均不需要它。
-- [claude-code-router](https://github.com/musistudio/claude-code-router)——凭据池状态与冷却模型思路。
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)——任务分发状态机与事件溯源思路。
-- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（**MIT**）——qpool 驱动的透传数据面，以**外部进程**方式经 Management API 对接。不捆绑，请独立安装运行。
-
-完整的第三方致谢见 [NOTICE](NOTICE)。
+原创实现，未拷贝任何第三方代码。思路与可公开观察的 API 事实受益于 [onWatch](https://github.com/onllm-dev/onWatch)（**GPL-3.0**，仅外部参考）、[claude-code-router](https://github.com/musistudio/claude-code-router)、[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)、[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（**MIT**，外部进程）。详见 [NOTICE](NOTICE)。
 
 ## 许可证
 
-[MIT](LICENSE)——第三方署名见 [NOTICE](NOTICE)。
+[MIT](LICENSE)

@@ -2,124 +2,16 @@
 
 **English** | [中文](README_CN.md)
 
-**Quota pooling + cost-aware routing for AI coding agents.**
+**Quota pooling + cost-aware routing for AI coding agents — burn the quota you already paid for before touching the metered API.**
 
-Your coding-agent subscriptions are already paid for. qpool pools the scattered
-quota from every agent CLI/IDE you own into one ledger, then routes each task to
-the cheapest entry that can actually do it — **already-paid subscription quota
-(marginal cost ≈ 0) first, soon-expiring credit packs next, pay-as-you-go only
-when nothing else fits.**
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python ≥ 3.9](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](pyproject.toml)
+[![dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](pyproject.toml)
 
-The way to save tokens is not to use fewer of them. It is to move work that
-would have hit a metered API onto quota you have already paid for.
-
-```
-subscription (paid, ~$0)  →  credit packs (expiring soon)  →  pay-as-you-go ($$)
-        consume first              before it expires              last resort
-```
-
-## Why
-
-| Pain | Today |
-| --- | --- |
-| Subscription quota goes unused | Cursor/Kiro/Codex monthly fees are paid, but the quota sits idle in silos |
-| Quota info is fragmented | N dashboards, N logins, N reset cycles to track |
-| Metered APIs cost real money | The default path burns cash with no cost awareness |
-| Credit packs expire | Free/purchased packs die quietly — nobody drains them first |
-| Price ≠ capability | The cheapest entry that *can* do the task is the one that should |
-
-## Architecture
-
-qpool is a **control plane**. It deliberately does not re-implement the
-passthrough gateway — that job belongs to
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which qpool drives
-through its Management API.
-
-```
-┌─ collectors (11 real APIs + manual channel + plugin dir)
-│     codex · claude-code · cursor · gemini · copilot · kimi
-│     cline · grok(xAI mgmt) · doubao(ark) · windsurf · devin
-│         │  qpool quota sync --apply
-│         ▼
-│   ┌───────────────────────────────────────────────┐
-│   │ quota ledger (SQLite)                          │
-│   │  entries: kind/total/remaining/TTL/cost/tier   │
-│   │  events:  append-only usage log                │
-│   └───────────────────────────────────────────────┘
-│         │ route_sort_key (marginal-cost ordering)
-│         ▼
-│   conductor: reconcile → disable/enable + priority + fill-first
-│         │  Management API (localhost:8317/v0/management)
-└─────────┤
-          ▼
-   CLIProxyAPI — protocol bridge + multi-account pool (not reinvented here)
-          │  ANTHROPIC_BASE_URL / OPENAI_BASE_URL
-          ▼
-   Claude Code · Codex CLI · any compatible harness
-          │  per-request tokens flow back via usage-queue
-          ▼
-   task-level accounting → monthly savings report
-```
-
-## Features
-
-- **Quota ledger** — one unified table for every agent × account: kind
-  (subscription / credit pack / payg), remaining, TTL, unit cost, capability
-  tier. Lazy reset-cycle rollover, append-only usage events (event sourcing).
-- **11 real collectors** — poll the vendors' own quota APIs using local CLI
-  credentials (OAuth files, OS keychains, app state DBs). No re-login.
-- **Cost-aware routing** — capability hard-filter first, then marginal-cost
-  order: fuller subscriptions → soonest-expiring packs → cheapest metered API.
-- **Route simulation** — the *three bills* before you commit a task:
-  routed cost vs pay-as-you-go cost vs saved-by-pooling, with a failover chain
-  and per-entry skip reasons.
-- **CLIProxyAPI control plane** — reconcile loop pushes decisions to the
-  gateway: disable exhausted credentials, re-enable recovered ones, write
-  priority fields, set `fill-first` so the pool drains cheapest-first.
-- **Task-level accounting** — drains the gateway's per-request usage queue
-  into the ledger; monthly report shows real money spent, payg-equivalent
-  value of pooled usage, and **saved by pooling**.
-- **Daemon** — `sync → reconcile → pull-usage` on an interval, with a
-  single-instance lock. Also `--once` for cron/launchd.
-- **Plugin collectors** — proprietary/internal agents live in
-  `~/.qpool/collectors/`, outside this repo (see below).
-
-## Install
-
-Requires Python ≥ 3.9, zero third-party dependencies.
-
-```bash
-git clone <your-fork-url> qpool && cd qpool
-python3.11 -m venv ~/.local/share/qpool/venv
-~/.local/share/qpool/venv/bin/pip install -e .
-mkdir -p ~/.local/bin
-ln -sf ~/.local/share/qpool/venv/bin/qpool ~/.local/bin/qpool   # on your PATH
-
-qpool quota list
-```
-
-## Quick start
-
-**1. Register quota manually**
-
-```bash
-qpool quota add --agent codex --account work --kind subscription \
-    --total 500 --unit requests --reset monthly --capability 4
-qpool quota add --agent claude-code --account main --kind credit_pack \
-    --total 1000000 --unit tokens --expires 2026-10-01 --capability 5
-qpool quota add --agent kimi-cli --account main --kind payg \
-    --cost-per-unit 0.000002 --unit tokens
-```
-
-**2. Or sync real readings from the vendors' own APIs** (auto-detects local
-CLI credentials; dry-run until `--apply`):
-
-```bash
-qpool quota sync            # show what every collector can read
-qpool quota sync --apply    # write readings into the ledger
-```
-
-**3. Simulate before you commit** — the three bills:
+Every coding agent silently spends your most expensive quota first. qpool
+flips that: it pools the scattered subscriptions, credit packs, and metered
+accounts from all your agent CLIs/IDEs into one ledger, then routes each task
+to the **cheapest entry that can actually do it**.
 
 ```bash
 $ qpool quota simulate --amount 500000 --unit tokens --tier 3
@@ -130,156 +22,211 @@ route plan for 500,000 tokens, capability >= T3:
   FALLBACK  #3 kimi-cli/main payg            T3  metered          est $1
 
 the three bills:
-  routed cost   : $0
-  payg-only     : $1
-  saved by pool : $1
+  routed cost   : $0      # what qpool would spend
+  payg-only     : $1      # what the default path would spend
+  saved by pool : $1      # ← this line is the whole point
 ```
 
-**4. Hook up CLIProxyAPI (the passthrough data plane)**
+The way to save tokens is not to use fewer of them. It is to move work that
+would have hit a metered API onto quota you have already paid for.
+
+## Why it exists
+
+- Your Cursor/Kiro/Codex subscriptions are **sunk costs** — quota left unused
+  at month's end is money burned anyway.
+- Credit packs are **depreciating assets** — they expire whether you use them
+  or not.
+- Metered APIs are **real marginal spend** — and the default path drains them
+  first, because no single dashboard sees the whole picture.
+
+Nobody routes by *marginal cost*. Routers route by rate limits, by task type,
+by round-robin — never by "which entry costs me nothing right now."
+
+## Architecture in 30 seconds
+
+qpool is a **control plane**. It deliberately does not re-implement the
+passthrough gateway — that job belongs to
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), which qpool drives
+through its Management API.
+
+```
+collectors: 11 real quota APIs (codex, claude, cursor, gemini, copilot, kimi,
+            cline, grok/xAI, doubao/ark, windsurf, devin) + manual + plugins
+      │  qpool quota sync --apply
+      ▼
+┌─ quota ledger (SQLite) ─────────────────────────────┐
+│  entries: kind / remaining / TTL / cost / tier       │
+│  events:  append-only usage log (event sourcing)     │
+└──────────────────────────────────────────────────────┘
+      │  route_sort_key: capability filter → marginal-cost order
+      ▼
+conductor: reconcile → disable/enable + priority + fill-first
+      │  Management API (CLIProxyAPI :8317)
+      ▼
+CLIProxyAPI — protocol bridge + multi-account pool (not reinvented here)
+      │  ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+      ▼
+Claude Code · Codex CLI · any compatible harness
+      │  per-request tokens flow back via usage-queue
+      ▼
+task-level accounting → monthly "saved by pooling" report
+```
+
+## Quick start (3 minutes)
+
+Python ≥ 3.9, **zero third-party dependencies**.
 
 ```bash
-export QPOOL_CPA_KEY=<remote-management.secret-key from your CLIProxyAPI yaml>
+pip install -e . && qpool quota list
 
-qpool quota cpa status              # credential pool × ledger, with decisions
-qpool quota cpa reconcile --apply   # push disable/enable + priority + fill-first
-qpool quota cpa pull-usage          # book per-request tokens into the ledger
+# register quota manually...
+qpool quota add --agent codex --account work --kind subscription \
+    --total 500 --unit requests --reset monthly --capability 4
+
+# ...or poll the vendors' own APIs with your local CLI credentials
+qpool quota sync --apply
+
+# the three bills before you commit a task
+qpool quota simulate --amount 500000 --unit tokens --tier 3
+
+# drive a real gateway (optional but recommended)
+export QPOOL_CPA_KEY=<CLIProxyAPI remote-management.secret-key>
+qpool quota cpa reconcile --apply   # push cost order into the pool
+qpool quota daemon                  # sync → reconcile → pull-usage, every 60s
+
+# end of month
+qpool quota report                  # real money spent vs saved by pooling
 ```
 
-Standard OpenAI-compatible providers (e.g. Doubao/Ark) skip OAuth bridging
-entirely — register them as upstreams straight into the gateway:
+## Design decisions
 
-```bash
-export ARK_API_KEY=...
-qpool quota cpa register-provider --name doubao --preset ark \
-    --model doubao-seed-2-1-pro-260628:doubao-pro
-# Agent Plan / Coding Plan subscribers: add --plan (switches to /api/plan/v3)
-# -> qpool quota cpa providers     to verify
-```
+This is the part worth reading. Each entry: options considered, what was
+chosen, and why.
 
-**5. Run the loop**
+### 1. Control plane over yet another gateway
 
-```bash
-qpool quota daemon                # every 60s: sync → reconcile → pull-usage
-qpool quota daemon --once         # single round, cron/launchd friendly
-```
+**Options:** (a) write my own OAuth-bridging, protocol-translating,
+multi-account gateway; (b) treat the gateway as solved and build only the
+decision layer.
 
-**6. See what pooling saved you**
+**Chose (b).** Protocol bridging is a commodity that CLIProxyAPI has already
+pushed to production quality — OAuth flows, four wire protocols, cooldowns,
+multi-account rotation. Rebuilding it would take months and always lag
+behind. qpool's irreplaceable value is the *cost-aware decision*, and
+CLIProxyAPI's Management API turned out to be read/write complete
+(`auth-files` status, `priority`, `routing/strategy`, `reset-quota`,
+`usage-queue`), which makes the split real, not aspirational. The rule of
+thumb I used: **own the layer where your differentiation lives, integrate
+everything else.**
 
-```bash
-qpool quota report
-#   real money spent (payg)       : $0.24
-#   pooled usage, payg-equivalent : $1
-#   saved by pooling              : $1
-```
+### 2. Marginal-cost layering instead of weighted routing
+
+**Options:** (a) round-robin; (b) weighted random by price; (c) a strict
+total order by marginal cost.
+
+**Chose (c).** The three quota kinds are economically *different objects*,
+not the same object at different weights: a subscription is a sunk cost
+(marginal cost 0, renews monthly), a credit pack is a depreciating asset
+(its value collapses to 0 at expiry), pay-as-you-go is true marginal spend.
+That is a sequencing problem, not a probability problem — so qpool computes
+a total order (subscription with most headroom → soonest-expiring pack →
+cheapest unit price) and pushes it to the gateway as `fill-first` +
+priorities, instead of sprinkling traffic across the pool.
+
+### 3. One unified ledger table instead of per-provider schemas
+
+The reference project (onWatch) creates **three tables per provider — 40+
+tables for 16 providers**; adding a vendor means a schema migration. qpool
+keeps one `quota_entries` table where `agent` is a column, and one
+`window_key` column handles vendors with several quota clocks (Codex's 5h /
+7d / credits all coexist as rows). Adding a vendor is a new row, not a new
+schema. Studying an existing project critically — taking its reset-cycle
+detection ideas while rejecting its data model — was more useful than
+copying it.
+
+### 4. Event sourcing, and two different write paths on purpose
+
+Usage is an **append-only event log**, never in-place updates: auditable,
+replayable, reconcilable. On top of that, the two write paths have
+deliberately different strictness: manual `consume` is strict (never
+overdraw, never spend expired quota — constraints), while gateway usage
+backfill is `force` (consumption already happened upstream — facts).
+Recording a fact past zero yields a negative `remaining`, which is a
+truthful "overdrawn" signal, not an error to suppress.
+
+### 5. Honest modeling of Fair-Use subscriptions
+
+Subscription APIs report `used_percent`, not absolute amounts — the absolute
+quota does not exist anywhere (that is what Fair Use means). qpool does not
+invent numbers: percentage-based entries display `38% left` with
+`total = NULL`; if the user supplies an estimated total, sync *calibrates*
+`remaining = total × (1 − used%)`. A model that admits what it cannot know
+beats a precise-looking fiction.
+
+### 6. Zero dependencies, even where it hurt
+
+Stdlib only: `sqlite3`, `argparse`, `urllib`, `hmac` — including a hand-rolled
+Volcano Engine signature V4 instead of pulling the vendor SDK. Install takes
+seconds, runs anywhere Python ≥ 3.9 does, and the supply-chain surface is
+the stdlib and nothing else.
+
+### 7. Open-source hygiene as a feature
+
+Proprietary collectors (company-internal agents) live in
+`~/.qpool/collectors/` — a plugin directory *outside* the repo, so internal
+logic never touches the public tree. GPL-licensed reference projects were
+used as external references only (ideas and publicly observable API facts,
+no copied code), documented in [NOTICE](NOTICE).
+
+## Engineering notes
+
+- **Lazy rollover instead of a background poller** — a CLI tool should not
+  need a daemon to stay correct; reset-cycle detection runs on read/write
+  (when it matters), catching up missed cycles by period arithmetic.
+- **message.id dedupe in transcript parsing** — coding-agent session files
+  rewrite the same message several times (streaming, retries); aggregation
+  dedupes by message id keeping the final, fullest record (same rule as
+  ccusage), which moved a real monthly estimate from a bogus $715 to the
+  correct ~$350.
+- **Consumed-vs-remaining telemetry** — metering APIs (Ark, Devin) report
+  consumption, not balance; the ledger accepts `consumed_abs` and derives
+  `remaining = total − consumed` against the entry's budget.
+
+## Testing
+
+No live vendor accounts in CI, so every integration is verified against
+local mock servers replaying the documented wire shapes: ~30 assertions
+covering credential detection, signature-V4 request construction, response
+parsing (including string numerics and nested payloads), ledger upsert
+idempotency, rolling-window rollover, reconcile decisions, priority
+orchestration, and usage backfill semantics.
 
 ## Collector coverage
 
-| Agent | Credentials source | Quota API | Notes |
-| --- | --- | --- | --- |
-| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` | 5h + 7d windows, credits |
-| Claude Code | macOS Keychain → `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` | OAuth beta header |
-| Cursor | `state.vscdb` ItemTable (read-only) | `api2.cursor.sh` Connect-RPC | email/membership too |
-| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | pro/flash families |
-| Copilot | `COPILOT_TOKEN` / IDE hosts.json | `api.github.com/copilot_internal/user` | free-plan normalize |
-| Kimi CLI | `~/.kimi-code/credentials/` | `api.kimi.com/coding/v1/usages` | string numerics tolerated |
-| Cline | `CLINE_API_KEY` | `api.cline.bot/api/v1/users/{id}/balance` | official REST |
-| Grok / xAI | `XAI_MANAGEMENT_KEY` + `XAI_TEAM_ID` | `management-api.x.ai/.../invoice/preview` | replaces gRPC-web reverse engineering |
-| Doubao / Ark | `VOLC_ACCESS_KEY_ID` + `VOLC_SECRET_ACCESS_KEY` | `GetInferenceUsage` (signature V4) | monthly consumption |
-| Windsurf | `WINDSURF_SERVICE_KEY` | `server.codeium.com/api/v1/GetTeamCreditBalance` | Enterprise |
-| Devin | `DEVIN_API_KEY` | `api.devin.ai/v3/.../consumption/daily` | Enterprise, ACU |
-| everything else | `~/.qpool/static_quotas.json` | — | manual channel (kiro, antigravity, qoder, opencode, …) |
-| internal agents | `~/.qpool/collectors/*.py` | your API | plugin dir, never committed |
-
-## CLI reference
-
-```
-qpool quota add        register a quota entry (subscription/credit_pack/payg)
-qpool quota list       ledger view (default: marginal-cost route order)
-qpool quota consume    record usage manually (strict: no overdraft)
-qpool quota remove     delete an entry and its events
-qpool quota events     append-only usage history
-qpool quota simulate   dry-run routing: the three bills + failover chain
-qpool quota report     monthly usage + savings report
-qpool quota sync       poll vendor APIs via local credentials (--apply to write)
-qpool quota cpa        CLIProxyAPI control plane: status/reconcile/pull-usage
-qpool quota daemon     control loop: sync -> reconcile -> pull-usage
-```
-
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `QPOOL_DB` | ledger path (default `~/.qpool/qpool.db`) |
-| `QPOOL_CPA_URL` | CLIProxyAPI base (default `http://localhost:8317`) |
-| `QPOOL_CPA_KEY` | CLIProxyAPI management key (`remote-management.secret-key`) |
-| `QPOOL_STATIC_QUOTAS` | manual-channel JSON path |
-| `QPOOL_COLLECTORS_DIR` | plugin collector dir (default `~/.qpool/collectors`) |
-| `CODEX_HOME`, `KIMI_CODE_HOME`, `COPILOT_TOKEN`, `GEMINI_TOKEN`, `CLINE_API_KEY`, `XAI_MANAGEMENT_KEY`, `XAI_TEAM_ID`, `VOLC_ACCESS_KEY_ID`, `VOLC_SECRET_ACCESS_KEY`, `ARK_API_KEY_ID`, `WINDSURF_SERVICE_KEY`, `DEVIN_API_KEY` | collector credentials |
-
-## Plugin collectors
-
-Internal or proprietary agents do not belong in this repo. Drop a Python file
-in `~/.qpool/collectors/` exposing three symbols and it joins the registry:
-
-```python
-# ~/.qpool/collectors/acme-agent.py
-from qp.collectors.base import QuotaReading
-
-AGENT = "acme-agent"
-
-def detect_credentials():
-    return {"access_token": "...", "source": "internal"}
-
-def fetch_readings(creds):
-    return [QuotaReading(agent="acme-agent", window_key="daily",
-                         label="acme-agent (internal)", used_percent=33.0)]
-```
-
-Then `qpool quota sync --agent acme-agent --apply` flows through the same
-pipeline as every built-in collector.
-
-## How routing works
-
-1. **Capability hard filter** — `capability_tier` of the entry must be ≥ what
-   the task needs (`--tier`), and the quota unit must match (`tokens` tasks
-   cannot spend `requests` quota).
-2. **Marginal-cost order** — subscriptions first (already paid; the fuller
-   one wins), credit packs next (soonest expiry wins — drain before it dies),
-   pay-as-you-go last (cheapest unit price wins). Expired/depleted entries
-   always sink to the bottom.
-3. **Gateway orchestration** — that order becomes `priority` fields +
-   `fill-first` on CLIProxyAPI, so the pool literally drains cheapest-first;
-   exhausted credentials get disabled, recovered ones re-enabled with
-   `reset-quota`.
-
-## A note on ToS risk
-
-Polling your own quota (what qpool's collectors do) is read-only. **Consuming
-subscription quota through a passthrough gateway is a different matter** —
-Google explicitly prohibits using an AI Pro subscription via API; other
-vendors are unenforced but gray. That risk lives in the passthrough layer
-(CLIProxyAPI and friends), not in this control plane. Know your vendors'
-terms; qpool only makes the accounting and routing visible to you.
+| Agent | Credentials | Quota API |
+| --- | --- | --- |
+| Codex | `~/.codex/auth.json` | `chatgpt.com/backend-api/wham/usage` (5h+7d windows) |
+| Claude Code | macOS Keychain / `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
+| Cursor | `state.vscdb` (read-only) | `api2.cursor.sh` Connect-RPC |
+| Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Copilot | `COPILOT_TOKEN` / IDE hosts.json | `api.github.com/copilot_internal/user` |
+| Kimi CLI | `~/.kimi-code/credentials/` | `api.kimi.com/coding/v1/usages` |
+| Cline | `CLINE_API_KEY` | `api.cline.bot` (official REST) |
+| Grok / xAI | `XAI_MANAGEMENT_KEY` | `management-api.x.ai` billing |
+| Doubao / Ark | Volcano AK/SK | `GetInferenceUsage` (signature V4) |
+| Windsurf / Devin | service keys | `server.codeium.com` / `api.devin.ai/v3` (Enterprise) |
+| anything else | `~/.qpool/static_quotas.json` | manual channel |
+| internal agents | `~/.qpool/collectors/*.py` | out-of-tree plugins |
 
 ## Acknowledgments
 
-qpool is an original implementation — no third-party code is copied into this
-repository. Ideas and publicly observable functional facts (API endpoints,
-credential locations) were informed by:
-
-- [onWatch](https://github.com/onllm-dev/onWatch) (**GPL-3.0**) — quota polling
-  and reset-cycle detection ideas. Used strictly as an **external reference**;
-  not included, copied, or linked, and not required to build or run qpool.
-- [claude-code-router](https://github.com/musistudio/claude-code-router) —
-  credential-pool status and cooldown model ideas.
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) — dispatch state
-  machine and event-sourcing ideas.
-- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (**MIT**) — the
-  passthrough data plane qpool drives, as an **external process** via its
-  Management API. Not bundled; install and run it separately.
-
-See [NOTICE](NOTICE) for the full third-party acknowledgment text.
+Original implementation; no third-party code is copied. Ideas and publicly
+observable API facts informed by [onWatch](https://github.com/onllm-dev/onWatch)
+(**GPL-3.0**, external reference only), [claude-code-router](https://github.com/musistudio/claude-code-router),
+[oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex), and
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (**MIT**, external
+process). See [NOTICE](NOTICE).
 
 ## License
 
-[MIT](LICENSE) — see also [NOTICE](NOTICE) for third-party attributions.
+[MIT](LICENSE)
