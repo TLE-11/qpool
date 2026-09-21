@@ -33,6 +33,8 @@ class QuotaReading:
     unit: str = "requests"
     used_percent: Optional[float] = None    # 0-100, None if unknown
     remaining_abs: Optional[float] = None   # absolute remaining (credit balances)
+    total_abs: Optional[float] = None       # absolute total (when the API reports it,
+                                            # e.g. qoder's 300-credit plan)
     consumed_abs: Optional[float] = None    # absolute consumed this period (metering APIs
                                             # like ark/devin report usage, not balance;
                                             # remaining is derived against the entry's total)

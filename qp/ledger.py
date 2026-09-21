@@ -482,28 +482,29 @@ def upsert_reading(db: Database, reading: Any, account_label: str = "auto") -> D
                 created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (reading.agent, account_label, kind, reading.capability_tier, reading.unit,
-            None, initial_remaining, 0.0, None, None, period_start,
-            reading.window_key, reading.window_seconds, initial_used,
-            iso(now), "; ".join(note_parts) or None, iso(now), iso(now)),
-       )
+             reading.total_abs, initial_remaining, 0.0, None, None, period_start,
+             reading.window_key, reading.window_seconds, initial_used,
+             iso(now), "; ".join(note_parts) or None, iso(now), iso(now)),
+        )
         db.conn.commit()
         return {"action": "created", "entry_id": int(cur.lastrowid)}
 
     remaining = row["remaining"]
     used_percent = reading.used_percent
+    total = reading.total_abs if reading.total_abs is not None else row["total"]
     if reading.remaining_abs is not None:
         remaining = reading.remaining_abs
-    elif reading.used_percent is not None and row["total"]:
-        remaining = round(row["total"] * (1.0 - reading.used_percent / 100.0), 4)
-    elif reading.consumed_abs is not None and row["total"]:
+    elif reading.used_percent is not None and total:
+        remaining = round(total * (1.0 - reading.used_percent / 100.0), 4)
+    elif reading.consumed_abs is not None and total:
         # metering APIs (ark, devin) report consumption, not balance
-        remaining = max(round(row["total"] - reading.consumed_abs, 4), 0)
-        if used_percent is None and row["total"] > 0:
-            used_percent = round(min(reading.consumed_abs / row["total"], 1.0) * 100.0, 2)
+        remaining = max(round(total - reading.consumed_abs, 4), 0)
+        if used_percent is None and total > 0:
+            used_percent = round(min(reading.consumed_abs / total, 1.0) * 100.0, 2)
     db.conn.execute(
-        """UPDATE quota_entries SET remaining = ?, used_percent = ?, last_synced_at = ?,
+        """UPDATE quota_entries SET remaining = ?, used_percent = ?, total = ?, last_synced_at = ?,
            period_start = COALESCE(?, period_start), updated_at = ? WHERE id = ?""",
-        (remaining, used_percent, iso(now), period_start, iso(now), row["id"]),
+        (remaining, used_percent, total, iso(now), period_start, iso(now), row["id"]),
     )
     db.conn.commit()
     return {"action": "updated", "entry_id": row["id"]}
