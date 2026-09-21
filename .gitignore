@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+
+# qpool runtime data (never commit the ledger or local plugins)
+.qpool/
+*.db
+*.db-journal
+qpool.daemon.lock
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,36 @@
+qpool — Quota pooling + cost-aware routing for AI coding agents
+Copyright (c) 2026 qpool contributors
+
+This project is licensed under the MIT License. See LICENSE for the full text.
+
+================================================================================
+Third-party acknowledgments
+================================================================================
+
+qpool is an original implementation. NO source code from the projects below
+is copied into, or linked into, this repository. They are acknowledged for
+ideas, architecture, and for publicly observable functional facts (vendor API
+endpoints, credential file locations, protocol header names), which are not
+copyrightable subject matter.
+
+  * onWatch — https://github.com/onllm-dev/onWatch — GPL-3.0
+      Quota-polling approach, reset-cycle detection ideas, and several vendor
+      credential locations informed qpool's collectors. Used strictly as an
+      external reference. No onWatch code is included, copied, or linked, and
+      no onWatch code is required to build or run qpool.
+
+  * claude-code-router — https://github.com/musistudio/claude-code-router
+      Credential-pool status model ({blocked, utilization}) and cooldown
+      state-machine ideas.
+
+  * oh-my-codex — https://github.com/Yeachan-Heo/oh-my-codex
+      Dispatch state-machine and event-sourcing ideas (append-only usage log,
+      authority lease for the single-instance daemon lock).
+
+  * CLIProxyAPI — https://github.com/router-for-me/CLIProxyAPI — MIT
+      qpool drives CLIProxyAPI as an EXTERNAL passthrough gateway through its
+      Management API over HTTP (separate process, installed and run
+      independently). No CLIProxyAPI code is included in this repository.
+      CLIProxyAPI's own license applies to CLIProxyAPI.
+
+If you redistribute qpool, this NOTICE file should be preserved.
