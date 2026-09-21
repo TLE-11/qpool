@@ -271,6 +271,14 @@ def route_sort_key(entry: Dict[str, Any]) -> Any:
     return (dead, rank, inner, entry["id"])
 
 
+STRATEGIES = ("cost", "capability")
+
+
+def capability_sort_key(entry: Dict[str, Any]) -> Any:
+    """Capability-first order: strongest model wins; cost breaks ties."""
+    return (-entry["capability_tier"], route_sort_key(entry))
+
+
 def consume(
     db: Database,
     entry_id: int,
@@ -357,23 +365,36 @@ def list_events(db: Database, *, entry_id: Optional[int] = None, limit: int = 50
 
 # ---------- routing simulation & reports ----------
 
-def plan_route(db: Database, amount: float, unit: str, min_tier: int = 1) -> Dict[str, Any]:
-    """Dry-run routing: capability hard filter -> marginal-cost order.
+# Units treated as interchangeable for coding tasks (credits are vendor
+# wrappers around token metering).
+UNIT_COMPAT = {
+    "tokens": {"tokens", "credits"},
+    "credits": {"credits", "tokens"},
+}
 
-    Returns the failover chain plus the "three bills"
-    (routed cost vs payg-only cost vs saved-by-pooling).
+
+def plan_route(db: Database, amount: float, unit: str, min_tier: int = 1,
+               unit_compat: bool = False, strategy: str = "cost") -> Dict[str, Any]:
+    """Dry-run routing: capability hard filter -> ordering by `strategy`.
+
+    strategy="cost" (default): cheapest entry that meets the tier floor wins.
+    strategy="capability": strongest entry wins, cost only breaks ties.
+    Returns the failover chain plus the "three bills".
     """
     if amount <= 0:
         raise LedgerError("amount must be > 0")
     if not 1 <= min_tier <= 5:
         raise LedgerError("tier must be between 1 and 5")
+    if strategy not in STRATEGIES:
+        raise LedgerError(f"strategy must be one of: {', '.join(STRATEGIES)}")
     apply_due_resets(db)
     entries = list_entries(db)
+    accepted_units = UNIT_COMPAT.get(unit, {unit}) if unit_compat else {unit}
     candidates: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     payg_prices: List[float] = []
     for e in entries:
-        if e["unit"] != unit:
+        if e["unit"] not in accepted_units:
             skipped.append(dict(e) | {"why": f"unit mismatch ({e['unit']} != {unit})"})
             continue
         if e["capability_tier"] < min_tier:
@@ -389,7 +410,7 @@ def plan_route(db: Database, amount: float, unit: str, min_tier: int = 1) -> Dic
             "covers": remaining is None or remaining >= amount,
             "est": amount * e["cost_per_unit"],
         })
-    candidates.sort(key=route_sort_key)
+    candidates.sort(key=capability_sort_key if strategy == "capability" else route_sort_key)
     primary_idx = next((i for i, c in enumerate(candidates) if c["covers"]), None)
     payg_only = amount * min(payg_prices) if payg_prices else None
     routed = candidates[primary_idx]["est"] if primary_idx is not None else None

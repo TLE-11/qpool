@@ -203,7 +203,9 @@ qpool quota report     monthly usage + savings report
 qpool quota sync       poll vendor APIs via local credentials (--apply to write)
 qpool quota cpa        CLIProxyAPI control plane: status/reconcile/pull-usage
 qpool quota daemon     control loop: sync -> reconcile -> pull-usage
+qpool quota run        dispatch a task to the cheapest capable agent, with failover
 ```
+
 
 ## Configuration
 
@@ -214,6 +216,8 @@ qpool quota daemon     control loop: sync -> reconcile -> pull-usage
 | `QPOOL_CPA_KEY` | CLIProxyAPI management key (`remote-management.secret-key`) |
 | `QPOOL_STATIC_QUOTAS` | manual-channel JSON path |
 | `QPOOL_COLLECTORS_DIR` | plugin collector dir (default `~/.qpool/collectors`) |
+| `~/.qpool/executors.json` | per-user agent→CLI mappings for `quota run` (out of repo): `{"cli": {"<agent>": ["<cli>", "-p"]}}` |
+| `~/.qpool/credentials.json` | API keys as env fallback (`{"ARK_API_KEY": "..."}`) |
 | `CODEX_HOME`, `KIMI_CODE_HOME`, `COPILOT_TOKEN`, `GEMINI_TOKEN`, `CLINE_API_KEY`, `XAI_MANAGEMENT_KEY`, `XAI_TEAM_ID`, `VOLC_ACCESS_KEY_ID`, `VOLC_SECRET_ACCESS_KEY`, `ARK_API_KEY_ID`, `WINDSURF_SERVICE_KEY`, `DEVIN_API_KEY` | collector credentials |
 
 ## Plugin collectors
@@ -246,11 +250,19 @@ pipeline as every built-in collector.
 2. **Marginal-cost order** — subscriptions first (already paid; the fuller
    one wins), credit packs next (soonest expiry wins — drain before it dies),
    pay-as-you-go last (cheapest unit price wins). Expired/depleted entries
-   always sink to the bottom.
+   always sink to the bottom. Two strategies: `--strategy cost` (default)
+   picks the cheapest entry that meets the tier floor; `--strategy capability`
+   picks the strongest entry and lets cost break ties.
 3. **Gateway orchestration** — that order becomes `priority` fields +
    `fill-first` on CLIProxyAPI, so the pool literally drains cheapest-first;
    exhausted credentials get disabled, recovered ones re-enabled with
    `reset-quota`.
+4. **Execution** — `qpool quota run "<task>"` walks the same failover chain
+   and actually dispatches: headless agent CLIs (mapped per-user in
+   `~/.qpool/executors.json`) or openai-compatible gateway upstreams, with
+   per-candidate timeout, a `--max-cost` payg guard, and failover on
+   quota/auth failure. The repo ships no agent-to-CLI mappings — which
+   harnesses you run is your configuration, not project knowledge.
 
 ## A note on ToS risk
 

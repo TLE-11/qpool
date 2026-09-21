@@ -82,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="tokens / requests / credits (must match entry units)")
     sim.add_argument("--tier", type=int, default=1, metavar="MIN-TIER",
                      help="minimum capability tier the task needs, 1-5 (default 1 = any)")
+    sim.add_argument("--strategy", choices=ledger.STRATEGIES, default="cost",
+                     help="cost: cheapest entry that meets the tier floor (default); "
+                          "capability: strongest entry first, cost breaks ties")
 
     rep = qsub.add_parser("report", help="monthly usage + savings report")
     rep.add_argument("--month", help="YYYY-MM (default: current month, UTC)")
@@ -111,6 +114,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seconds between rounds (default 60)")
     dm.add_argument("--once", action="store_true",
                     help="run a single round and exit (cron/launchd friendly)")
+
+    run = qsub.add_parser("run",
+                          help="dispatch a task to the cheapest capable agent, with failover")
+    run.add_argument("task", help="the task prompt to execute")
+    run.add_argument("--amount", type=float, default=50000,
+                     help="estimated task size in tokens for cost planning (default 50000)")
+    run.add_argument("--tier", type=int, default=1, metavar="MIN-TIER",
+                     help="minimum capability tier the task needs, 1-5 (default 1)")
+    run.add_argument("--cwd", help="working directory for CLI agents (default: current dir)")
+    run.add_argument("--timeout", type=int, default=900,
+                     help="per-candidate timeout in seconds (default 900)")
+    run.add_argument("--max-cost", type=float,
+                     help="skip payg candidates whose est. marginal cost exceeds this (USD)")
+    run.add_argument("--strategy", choices=ledger.STRATEGIES, default="cost",
+                     help="cost: cheapest capable entry (default); capability: strongest first")
+    run.add_argument("--dry-run", action="store_true",
+                     help="print the dispatch plan without executing")
 
     cpa_sub.add_parser("providers", help="list upstream OpenAI-compatible providers")
     reg = cpa_sub.add_parser("register-provider",
@@ -301,9 +321,10 @@ def cmd_quota_events(db: Database, args: argparse.Namespace) -> None:
 
 
 def cmd_quota_simulate(db: Database, args: argparse.Namespace) -> None:
-    plan = ledger.plan_route(db, args.amount, args.unit, args.tier)
+    plan = ledger.plan_route(db, args.amount, args.unit, args.tier,
+                             strategy=args.strategy)
     print(f"route plan for {fmt_num(plan['amount'])} {plan['unit']}, "
-          f"capability >= T{plan['min_tier']}:\n")
+          f"capability >= T{plan['min_tier']}, strategy={args.strategy}:\n")
     if not plan["candidates"]:
         print("  no eligible entries.")
     for i, c in enumerate(plan["candidates"]):
@@ -507,6 +528,54 @@ def cmd_quota_cpa(db: Database, args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_quota_run(db: Database, args: argparse.Namespace) -> None:
+    from . import executors
+
+    plan = ledger.plan_route(db, args.amount, "tokens", args.tier,
+                             unit_compat=True, strategy=args.strategy)
+    chain = []
+    for c in plan["candidates"]:
+        agent = c["agent"]
+        channel = "cli" if agent in executors.CLI_EXECUTORS else "gateway"
+        chain.append((c, agent, channel))
+    if not chain:
+        print("error: no eligible entries with an execution channel.\n"
+              "hint: sync your ledger first (`qpool quota sync --apply`), and map "
+              "agent CLIs in ~/.qpool/executors.json, e.g.\n"
+              '  {"cli": {"<agent-name>": ["<cli-command>", "-p"]}}', file=sys.stderr)
+        sys.exit(1)
+
+    print(f"dispatch plan (~{fmt_num(args.amount)} tokens, tier>=T{args.tier}):")
+    for i, (c, agent, channel) in enumerate(chain):
+        role = "PRIMARY " if i == 0 else "FALLBACK"
+        est = fmt_cost(c["est"])
+        print(f"  {role}  {agent:<12} [{channel}] entry #{c['id']}  est {est}")
+    if args.dry_run:
+        print("\ndry-run only; re-run without --dry-run to execute")
+        return
+
+    for c, agent, channel in chain:
+        est_cost = c["est"]
+        if args.max_cost is not None and c["kind"] == "payg" and est_cost > args.max_cost:
+            print(f"skip {agent}: est {fmt_cost(est_cost)} exceeds --max-cost")
+            continue
+        print(f"\n→ trying {agent} [{channel}] (est {fmt_cost(est_cost)})...", flush=True)
+        result = executors.execute(agent, args.task, cwd=args.cwd, timeout=args.timeout)
+        if result.success:
+            if result.output.strip():
+                print(result.output.rstrip())
+            print(f"\n✓ completed via {agent} in {result.duration_s:.1f}s")
+            if channel == "cli":
+                print(f"  usage will appear in the ledger after `qpool quota sync --apply`")
+            else:
+                print(f"  book it now with `qpool quota cpa pull-usage`")
+            return
+        print(f"✗ {agent} failed ({result.error.strip()[:160] or 'unknown error'}); "
+              f"failing over...", flush=True)
+    print("error: every candidate failed; see messages above", file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_quota_daemon(db: Database, args: argparse.Namespace) -> None:
     import fcntl
     import time as _time
@@ -568,6 +637,7 @@ def main(argv: Any = None) -> None:
         ("quota", "sync"): cmd_quota_sync,
         ("quota", "cpa"): cmd_quota_cpa,
         ("quota", "daemon"): cmd_quota_daemon,
+        ("quota", "run"): cmd_quota_run,
     }
     db = Database()
     try:

@@ -183,6 +183,7 @@ qpool quota report     月度用量 + 节省报表
 qpool quota sync       用本机凭据轮询厂商 API（--apply 写入台账）
 qpool quota cpa        CLIProxyAPI 控制面：status/reconcile/pull-usage
 qpool quota daemon     控制循环：sync -> reconcile -> pull-usage
+qpool quota run        把任务派发给"干得了且最便宜"的 agent，带 failover
 ```
 
 ## 配置
@@ -194,6 +195,8 @@ qpool quota daemon     控制循环：sync -> reconcile -> pull-usage
 | `QPOOL_CPA_KEY` | CLIProxyAPI 管理密钥（`remote-management.secret-key`） |
 | `QPOOL_STATIC_QUOTAS` | manual 通道 JSON 路径 |
 | `QPOOL_COLLECTORS_DIR` | 插件采集器目录（默认 `~/.qpool/collectors`） |
+| `~/.qpool/executors.json` | `quota run` 的 agent→CLI 映射（仓库外）：`{"cli": {"<agent>": ["<cli>", "-p"]}}` |
+| `~/.qpool/credentials.json` | API key 的环境变量兜底（`{"ARK_API_KEY": "..."}`） |
 | `CODEX_HOME`、`KIMI_CODE_HOME`、`COPILOT_TOKEN`、`GEMINI_TOKEN`、`CLINE_API_KEY`、`XAI_MANAGEMENT_KEY`、`XAI_TEAM_ID`、`VOLC_ACCESS_KEY_ID`、`VOLC_SECRET_ACCESS_KEY`、`ARK_API_KEY_ID`、`WINDSURF_SERVICE_KEY`、`DEVIN_API_KEY` | 各采集器凭据 |
 
 ## 插件采集器
@@ -219,8 +222,9 @@ def fetch_readings(creds):
 ## 路由原理
 
 1. **能力硬约束**——条目的 `capability_tier` 必须 ≥ 任务需求（`--tier`），且额度单位必须匹配（tokens 任务不能花 requests 额度）。
-2. **边际成本排序**——订阅优先（已付费，剩余多者先）、额度包次之（最快过期者先，过期前榨干）、按量最后（单价低者先）。过期/耗尽的条目永远垫底。
+2. **边际成本排序**——订阅优先（已付费，剩余多者先）、额度包次之（最快过期者先，过期前榨干）、按量最后（单价低者先）。过期/耗尽的条目永远垫底。两种策略：`--strategy cost`（默认）在达标线内选最便宜；`--strategy capability` 最强者优先、成本仅作平级 tiebreak。
 3. **网关编排**——这个顺序会被翻译成 CLIProxyAPI 的 `priority` 字段 + `fill-first` 策略，池子严格按"最便宜优先"消耗；耗尽的凭据被禁用，恢复的凭据被启用并 `reset-quota`。
+4. **执行调度**——`qpool quota run "<task>"` 沿着同一条 failover 链真正派发：headless CLI（映射在用户自己的 `~/.qpool/executors.json`）或网关上游，带单候选超时、`--max-cost` 按量保护、配额/鉴权失败自动 failover。仓库不含任何 agent→CLI 映射——你装了哪些 harness 是你的配置，不是项目知识。
 
 ## ToS 风险说明
 
