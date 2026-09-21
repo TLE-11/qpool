@@ -30,6 +30,8 @@ AGENT_TO_CPA_PROVIDERS = {
     "kimi-cli": ["kimi", "moonshot"],
     "cursor": ["cursor"],
     "copilot": ["copilot", "github-copilot"],
+    # openai-compatibility upstreams are recorded under their registered name
+    "doubao": ["doubao", "ark", "volcengine"],
 }
 
 DECISION_ENABLE = "enable"
@@ -236,6 +238,9 @@ def pull_usage(
     total_tokens = 0.0
     for rec in records:
         provider = (rec.get("provider") or "").lower()
+        # openai-compatibility upstreams are recorded as "openai-compatible-<name>"
+        if provider.startswith("openai-compatible-"):
+            provider = provider[len("openai-compatible-"):]
         agent = reverse.get(provider)
         tokens = rec.get("tokens") or {}
         amount = tokens.get("total_tokens")
