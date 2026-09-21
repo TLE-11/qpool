@@ -222,7 +222,9 @@ def cmd_quota_list(db: Database, args: argparse.Namespace) -> None:
               ledger.STATUS_EXPIRED: 0, ledger.STATUS_DEPLETED: 0}
     for e in entries:
         counts[e["status"]] += 1
-        if e["remaining"] is not None:
+        if e["remaining"] is not None and e["remaining"] < 0:
+            quota = f"used {fmt_num(-e['remaining'])}"  # net consumption, no total known
+        elif e["remaining"] is not None:
             quota = f"{fmt_num(e['remaining'])}/{fmt_num(e['total'])}"
         elif e["used_percent"] is not None:
             quota = f"{100.0 - e['used_percent']:.0f}% left"

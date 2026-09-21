@@ -89,7 +89,9 @@ def entry_status(entry: Any, now: datetime) -> str:
     if exp_raw and parse_dt(exp_raw) <= now:
         return STATUS_EXPIRED
     remaining = entry["remaining"]
-    if remaining is not None and remaining <= 0:
+    # depleted requires a real total; negative remaining with total=NULL is
+    # net-consumption bookkeeping (consumption-only collectors), not exhaustion
+    if remaining is not None and remaining <= 0 and entry["total"]:
         return STATUS_DEPLETED
     if exp_raw and parse_dt(exp_raw) <= now + timedelta(days=EXPIRING_SOON_DAYS):
         return STATUS_EXPIRING
@@ -472,8 +474,12 @@ def upsert_reading(db: Database, reading: Any, account_label: str = "auto") -> D
             note_parts.append(f"acct: {reading.account_hint}")
         initial_remaining = reading.remaining_abs
         initial_used = reading.used_percent
-        if initial_remaining is None and initial_used is None and reading.consumed_abs is not None:
-            initial_used = None  # consumed alone can't fix a percentage without a total
+        if initial_remaining is None and reading.consumed_abs is not None:
+            # consumption-only reading with no known total: book net usage as a
+            # negative remaining (same "overdrawn = net consumed" convention as
+            # gateway backfill), so the list view can show it
+            initial_remaining = -reading.consumed_abs
+            initial_used = None
         cur = db.conn.execute(
             """INSERT INTO quota_entries
                (agent, account, kind, capability_tier, unit, total, remaining,
@@ -501,6 +507,9 @@ def upsert_reading(db: Database, reading: Any, account_label: str = "auto") -> D
         remaining = max(round(total - reading.consumed_abs, 4), 0)
         if used_percent is None and total > 0:
             used_percent = round(min(reading.consumed_abs / total, 1.0) * 100.0, 2)
+    elif reading.consumed_abs is not None:
+        # no total: track net consumption as negative remaining
+        remaining = -reading.consumed_abs
     db.conn.execute(
         """UPDATE quota_entries SET remaining = ?, used_percent = ?, total = ?, last_synced_at = ?,
            period_start = COALESCE(?, period_start), updated_at = ? WHERE id = ?""",
