@@ -1,24 +1,16 @@
-"""Conductor: reconcile the qpool ledger with the CLIProxyAPI credential pool.
-
-The ledger knows marginal costs and quota states; CLIProxyAPI knows how to
-route requests. The conductor matches ledger entries to CPA credentials and
-pushes cost-aware scheduling decisions:
-
-- all of a credential's ledger windows depleted/expired -> disable it
-- any window recovered (rollover, fresh sync)          -> enable + reset-quota
-- short windows (codex 5h) are left to CPA's own cooldown; qpool only acts on
-  decisive exhaustion (every tracked window dead)
-
-It also drains CPA's per-request usage queue into the ledger's usage_events,
-which is the data source for task-level accounting and the savings report.
-"""
+"""Exact CPA bindings, owned pauses and idempotent receipts; quota snapshots stay authoritative."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import ledger
+from . import ledger, profiles, pools
 from .cpa import CpaClient
+from .collectors.base import CollectorError
 from .db import Database
 
 # ledger agent -> candidate CPA provider names (auth-files[].provider)
@@ -40,241 +32,175 @@ DECISION_KEEP = "keep"
 DECISION_UNTRACKED = "untracked"
 
 
-def _providers_for(agent: str) -> List[str]:
-    return AGENT_TO_CPA_PROVIDERS.get(agent, [agent])
+def reconcile(db: Database, cpa: CpaClient, *, apply: bool = False,
+              strategy: Optional[str] = None, set_priority: bool = False) -> List[Dict[str, Any]]:
+    """Only exact, verified and exclusively managed bindings may be paused/resumed.
 
-
-def _cred_identity(file: Dict[str, Any]) -> str:
-    """Best-effort account identity of a CPA credential."""
-    for key in ("email", "name", "label", "id"):
-        value = file.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def match_credentials(
-    entries: List[Dict[str, Any]],
-    files: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Pair each CPA credential with its ledger entries (same agent + account)."""
-    matched: List[Dict[str, Any]] = []
-    for f in files:
-        provider = (f.get("provider") or "").lower()
-        identity = _cred_identity(f).lower()
-        owned: List[Dict[str, Any]] = []
-        for e in entries:
-            if provider and provider not in _providers_for(e["agent"]):
-                continue
-            account = (e["account"] or "").lower()
-            if identity and account and (account in identity or identity in account):
-                owned.append(e)
-            elif identity and not account:
-                owned.append(e)  # ledger auto-created entries use account "auto"
-        matched.append({"file": f, "entries": owned})
-    return matched
-
-
-def decide(entries: List[Dict[str, Any]], file: Dict[str, Any]) -> Tuple[str, str]:
-    """Scheduling decision for one credential.
-
-    Returns (decision, reason). decision in DECISION_*.
+    Global strategy/priority writes are intentionally withheld until the deployed
+    CPA contract has been verified. Model-scoped limits never disable an account.
     """
-    disabled_now = bool(file.get("disabled"))
-    if not entries:
-        return DECISION_UNTRACKED, "no ledger entries; run `qpool quota sync --apply` first"
-    now = ledger.now_utc()
-    statuses = [ledger.entry_status(e, now) for e in entries]
-    dead = all(s in (ledger.STATUS_EXPIRED, ledger.STATUS_DEPLETED) for s in statuses)
-    if dead:
-        if disabled_now:
-            return DECISION_KEEP, "already disabled; all windows dead"
-        return DECISION_DISABLE, f"all tracked windows exhausted: {', '.join(statuses)}"
-    if disabled_now:
-        return DECISION_ENABLE, f"quota recovered ({', '.join(statuses)})"
-    return DECISION_KEEP, f"active ({', '.join(statuses)})"
-
-
-def _pair_sort_key(pair: Dict[str, Any]) -> Any:
-    """A credential ranks by its BEST ledger window (marginal-cost order)."""
-    entries = pair["entries"]
-    if not entries:
-        return (1, 0, 0, 0, 0)  # untracked credentials always last
-    best = min(ledger.route_sort_key(e) for e in entries)
-    return (0,) + tuple(best) if isinstance(best, tuple) else (0, best)
-
-
-def compute_priorities(
-    entries: List[Dict[str, Any]],
-    files: List[Dict[str, Any]],
-) -> Dict[str, int]:
-    """Full ordering of the credential pool by marginal cost.
-
-    Returns {credential_name: priority} where lower = consume first
-    (steps of 10 leave room for manual interleaving).
-    """
-    pairs = match_credentials(entries, files)
-    ordered = sorted(pairs, key=_pair_sort_key)
-    priorities: Dict[str, int] = {}
-    for rank, pair in enumerate(ordered):
-        name = _cred_identity(pair["file"]) or (pair["file"].get("name") or "?")
-        priorities[name] = (rank + 1) * 10
-    return priorities
-
-
-def reconcile(
-    db: Database,
-    cpa: CpaClient,
-    *,
-    apply: bool = False,
-    strategy: Optional[str] = None,
-    set_priority: bool = False,
-) -> List[Dict[str, Any]]:
-    """Diff ledger vs CPA pool and (optionally) push scheduling decisions.
-
-    Decisions pushed when apply=True:
-    - disable/enable credentials per ledger exhaustion state
-    - priority fields per marginal-cost ordering (fill-first consumes the
-      cheapest-first subscription quota before touching pay-as-you-go)
-    - the routing strategy itself (default fill-first for cost layering)
-    """
+    config = profiles.load()
     ledger.apply_due_resets(db)
-    entries = ledger.list_entries(db)
-    files = cpa.list_auth_files()
-    pairs = match_credentials(entries, files)
-    priorities = compute_priorities(entries, files)
-
-    plan: List[Dict[str, Any]] = []
-    for pair in pairs:
-        f = pair["file"]
-        action, reason = decide(pair["entries"], f)
-        name = _cred_identity(f) or (f.get("name") or "?")
-        record = {
-            "name": name,
-            "provider": f.get("provider") or "-",
-            "cpa_status": f.get("status") or "-",
-            "disabled": bool(f.get("disabled")),
-            "ledger_entries": [e["id"] for e in pair["entries"]],
-            "priority": priorities.get(name),
-            "decision": action,
-            "reason": reason,
-            "applied": False,
-            "priority_applied": False,
-        }
-        if apply and action == DECISION_DISABLE:
-            cpa.set_auth_disabled(name, True)
-            record["applied"] = True
-        elif apply and action == DECISION_ENABLE:
-            cpa.set_auth_disabled(name, False)
-            auth_index = f.get("auth_index")
-            if auth_index:
-                cpa.reset_quota(str(auth_index))
-            record["applied"] = True
-        if apply and set_priority and record["priority"] is not None:
-            try:
-                cpa.set_auth_fields(name, priority=record["priority"])
-                record["priority_applied"] = True
-            except Exception:
-                # older CPA builds may ignore/reject priority on OAuth
-                # credentials; the disable/enable plan still stands
-                record["priority_applied"] = False
+    plan = []
+    for f in cpa.list_auth_files():
+        name, provider = f.get("name"), (f.get("provider") or "").lower()
+        owners = [a for a in config["accounts"].values()
+                  if a.get("cpa", {}).get("auth_name") == name
+                  and a.get("cpa", {}).get("provider") == provider]
+        record = {"name": name or "?", "provider": provider or "-",
+                  "cpa_status": f.get("status") or "-", "disabled": bool(f.get("disabled")),
+                  "ledger_entries": [], "priority": None, "decision": DECISION_UNTRACKED,
+                  "reason": "no unique explicit CPA binding", "applied": False,
+                  "priority_applied": False, "strategy_applied": False}
         plan.append(record)
-    if apply and strategy:
-        cpa.set_strategy(strategy)
+        if len(owners) != 1:
+            continue
+        account = owners[0]
+        binding = account["cpa"]
+        subject_field = binding.get("subject_field")
+        try:
+            identity_ok = subject_field and str(profiles.field(f, subject_field)) == str(
+                account["source"]["expected_subject"])
+        except CollectorError:
+            identity_ok = False
+        if not binding.get("exclusive") or not identity_ok:
+            record["reason"] = "CPA identity or complete funding coverage is unverified"
+            continue
+        owned = [p for p in config["pools"].values() if p["account_id"] == account["id"]]
+        record["ledger_entries"] = [r[0] for p in owned for r in db.conn.execute(
+            "SELECT id FROM quota_entries WHERE pool_id=?", (p["id"],))]
+        verdicts = [pools.evaluate(db, p, "*") for p in owned]
+        all_blocked = bool(owned) and all(v["state"] == "blocked" for v in verdicts)
+        scoped_models = {w["scope"] for p in owned for w in p["windows"] if w["scope"] != "*"}
+        models = scoped_models | {c["model"] for c in config["channels"]
+                                  if c["account_id"] == account["id"]}
+        if not scoped_models:
+            models.add("*")
+        ready = any(pools.evaluate(db, p, model)["state"] == "ready" for p in owned for model in models)
+        pause_key = hashlib.sha256(cpa.base_url.encode()).hexdigest() + ":" + name
+        stamp = json.dumps([account["id"], account["agent"], account["source"]["expected_subject"], name])
+        pause = db.conn.execute("SELECT binding FROM cpa_pauses WHERE name=?", (pause_key,)).fetchone()
+        ours = bool(pause and pause[0] == stamp)
+        record.update(decision=DECISION_KEEP, reason="quota unknown or model-scoped; keep credential state")
+        if all_blocked and not record["disabled"]:
+            record.update(decision=DECISION_DISABLE, reason="all funding pools blocked by common limits")
+            if apply:
+                cpa.set_auth_disabled(name, True)
+                with db.conn:
+                    db.conn.execute("INSERT OR REPLACE INTO cpa_pauses VALUES (?, ?)", (pause_key, stamp))
+                record["applied"] = True
+        elif record["disabled"] and ours and ready:
+            record.update(decision=DECISION_ENABLE, reason="qpool pause recovered with fresh quota evidence")
+            if apply:
+                cpa.set_auth_disabled(name, False)
+                with db.conn:
+                    db.conn.execute("DELETE FROM cpa_pauses WHERE name=?", (pause_key,))
+                record["applied"] = True
+        elif record["disabled"] and not ours:
+            record["reason"] = "disabled outside qpool; automatic recovery is forbidden"
+        elif ready:
+            record["reason"] = "available; global priority/strategy contract remains unverified"
     return plan
 
 
 def sync_all(db: Database, account_label: str = "auto") -> Dict[str, Any]:
-    """Silently poll every collector with usable credentials and upsert readings.
+    """Daemon writes only accounts with explicit, checked identities."""
+    result = pools.sync_accounts(db, apply=True)
+    return {"synced": result["synced"], "errors": result["errors"]}
 
-    Used by the daemon; the interactive `quota sync` command renders its own
-    table instead.
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def pull_usage(db: Database, cpa: CpaClient, *, count: int = 100,
+               provider_agent_hint: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Persist receipts once; exact source attribution only. Never mutate snapshots.
+
+    CPA's destructive dequeue has no local zero-loss guarantee. Once committed,
+    request IDs are idempotent; unmatched receipts remain queryable as pending.
     """
-    from .collectors import COLLECTORS, CollectorError
-
-    synced = 0
-    errors: List[str] = []
-    for agent, mod in COLLECTORS.items():
-        creds = mod.detect_credentials()
-        if creds is None:
-            continue
-        try:
-            readings = mod.fetch_readings(creds)
-        except CollectorError as exc:
-            errors.append(f"{agent}: {exc}")
-            continue
-        except Exception as exc:  # a broken collector must not kill the loop
-            errors.append(f"{agent}: {type(exc).__name__}: {exc}")
-            continue
-        for r in readings:
-            ledger.upsert_reading(db, r, account_label=account_label)
-            synced += 1
-    return {"synced": synced, "errors": errors}
-
-
-def pull_usage(
-    db: Database,
-    cpa: CpaClient,
-    *,
-    count: int = 100,
-    provider_agent_hint: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    """Drain CPA per-request usage records into ledger usage_events.
-
-    Mapping: record.provider -> ledger agent (via hint or AGENT_TO_CPA_PROVIDERS
-    reversed), record.source (email) -> ledger account. Unmapped records are
-    counted and skipped (never silently dropped).
-    """
+    config = profiles.load()
     records = cpa.drain_usage_queue(count)
-    reverse: Dict[str, str] = {}
-    for agent, providers in AGENT_TO_CPA_PROVIDERS.items():
-        for p in providers:
-            reverse.setdefault(p, agent)
-    if provider_agent_hint:
-        reverse.update(provider_agent_hint)
-
-    consumed = 0
-    skipped: List[str] = []
-    total_tokens = 0.0
+    namespace = _hash(cpa.base_url)
+    reverse = {p: a for a, providers in AGENT_TO_CPA_PROVIDERS.items() for p in providers}
+    reverse.update(provider_agent_hint or {})
+    consumed, total_tokens, skipped = 0, 0.0, []
     for rec in records:
-        provider = (rec.get("provider") or "").lower()
+        rec = rec if isinstance(rec, dict) else {}
+        provider = rec.get("provider")
+        provider = provider.lower()[:256] if isinstance(provider, str) else ""
         # openai-compatibility upstreams are recorded as "openai-compatible-<name>"
         if provider.startswith("openai-compatible-"):
             provider = provider[len("openai-compatible-"):]
-        agent = reverse.get(provider)
-        tokens = rec.get("tokens") or {}
+        # fall back to the raw provider name: custom upstreams registered under
+        # their own name (e.g. maas-gpt) map to the same-named ledger agent,
+        # mirroring _providers_for's default
+        agent = reverse.get(provider) or provider
+        source_hash = _hash(str(rec.get("source") or ""))
+        model = str(rec.get("model") or "")[:256]
+        rid = rec.get("request_id")
+        rid = rid if isinstance(rid, str) and 0 < len(rid) <= 256 else None
+        tokens = rec.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
         amount = tokens.get("total_tokens")
-        if not agent or not isinstance(amount, (int, float)) or amount <= 0:
-            skipped.append(rec.get("request_id") or provider or "?")
-            continue
-        source = (rec.get("source") or "").lower()
-        row = None
-        candidates = db.conn.execute(
-            "SELECT * FROM quota_entries WHERE agent = ? ORDER BY id", (agent,)
-        ).fetchall()
-        for cand in candidates:
-            account = (cand["account"] or "").lower()
-            if source and account and (account in source or source in account):
-                row = cand
-                break
-        if row is None and len(candidates) == 1:
-            row = candidates[0]
-        if row is None:
-            skipped.append(f"{agent}/{source or 'unknown'}")
-            continue
+        if (isinstance(amount, bool) or not isinstance(amount, (int, float))
+                or not math.isfinite(amount) or amount < 0):
+            amount = None
+        owners = [a for a in config["accounts"].values()
+                  if a["agent"] == agent and a.get("cpa", {}).get("exclusive")
+                  and a.get("cpa", {}).get("usage_source")
+                  and _hash(str(a["cpa"]["usage_source"])) == source_hash]
+        matched_pool, account_id = None, None
+        reason = "missing request ID or usage" if rid is None or amount is None else "no exact account/funding attribution"
+        if rid and amount is not None and len(owners) == 1:
+            account_id = owners[0]["id"]
+            owned = [p for p in config["pools"].values() if p["account_id"] == account_id]
+            if len(owned) == 1:
+                matched_pool = owned[0]
+        if matched_pool:
+            registered = db.conn.execute("SELECT * FROM quota_pools WHERE id=?", (matched_pool["id"],)).fetchone()
+            if not registered or registered["account_id"] != account_id or registered["subject"] != matched_pool["subject"]:
+                matched_pool = None
+                reason = "account/pool registration is missing or changed"
+        cost = None
+        if matched_pool:
+            if matched_pool["kind"] != "payg":
+                cost = 0.0
+            elif matched_pool["unit"] == "tokens":
+                cost = amount * matched_pool["cost_per_unit"]
+                if not math.isfinite(cost):
+                    cost = None
+        status = "matched" if matched_pool else "pending"
+        now = ledger.iso(ledger.now_utc())
+        occurred = rec.get("timestamp")
         try:
-            ledger.consume(
-                db, row["id"], amount,
-                input_tokens=tokens.get("input_tokens"),
-                output_tokens=tokens.get("output_tokens"),
-                cached_tokens=tokens.get("cached_tokens"),
-                task_ref=rec.get("request_id"),
-                note=f"cpa {provider} {rec.get('model') or ''}".strip(),
-                force=True,  # fact-backfill: already consumed upstream
-            )
+            occurred = ledger.iso(ledger.parse_dt(occurred)) if isinstance(occurred, str) else now
+        except ledger.LedgerError:
+            occurred = now
+        counts = []
+        for key in ("input_tokens", "output_tokens", "cached_tokens"):
+            val = tokens.get(key)
+            counts.append(val if isinstance(val, int) and not isinstance(val, bool)
+                          and 0 <= val <= 2**63 - 1 else None)
+        with db.conn:
+            db.conn.execute("BEGIN IMMEDIATE")
+            previous = db.conn.execute("SELECT * FROM imported_usage WHERE namespace=? AND request_id=?",
+                                       (namespace, rid)).fetchone() if rid else None
+            if previous:
+                if (previous["provider"], previous["source"], previous["model"], previous["amount"]) != (
+                        provider, source_hash, model, amount):
+                    skipped.append("conflicting receipt; original retained")
+                continue
+            db.conn.execute("""INSERT INTO imported_usage
+                (namespace, request_id, provider, source, model, pool_id, account_id, amount,
+                 input_tokens, output_tokens, cached_tokens, est_cost_usd, status, reason,
+                 occurred_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (namespace, rid, provider, source_hash, model, matched_pool["id"] if matched_pool else None,
+                 account_id, amount, *counts, cost, status, None if matched_pool else reason, occurred, now))
+        if matched_pool:
             consumed += 1
             total_tokens += amount
-        except ledger.LedgerError:
-            skipped.append(f"{agent}#{row['id']}")
-    return {"records": len(records), "consumed": consumed,
-            "tokens": total_tokens, "skipped": skipped}
+        else:
+            skipped.append(reason)
+    return {"records": len(records), "consumed": consumed, "tokens": total_tokens, "skipped": skipped}

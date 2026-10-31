@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -61,11 +62,16 @@ def _fetch_usage(creds: Dict[str, Any]) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {creds['access_token']}"}
     if creds.get("account_id"):
         headers["chatgpt-account-id"] = creds["account_id"]
+    def budget():
+        remaining = min(15, creds['_deadline'] - time.monotonic()) if creds.get('_deadline') is not None else 15
+        if remaining <= 0:
+            raise CollectorError('quota request deadline exceeded')
+        return remaining
     try:
-        return http_json(USAGE_URL, headers=headers)
+        return http_json(USAGE_URL, headers=headers, timeout=budget())
     except CollectorError as exc:
         if "unexpected HTTP 404" in str(exc):
-            return http_json(FALLBACK_USAGE_URL, headers=headers)
+            return http_json(FALLBACK_USAGE_URL, headers=headers, timeout=budget())
         raise
 
 
@@ -97,14 +103,17 @@ def fetch_readings(creds: Dict[str, Any]) -> List[QuotaReading]:
     hint = creds.get("account_id") or ""
     readings: List[QuotaReading] = []
     rate = data.get("rate_limit") or {}
-    primary = _window_reading("five_hour", "codex 5-hour window",
-                              rate.get("primary_window"), plan, hint)
-    if primary:
-        readings.append(primary)
-    secondary = _window_reading("seven_day", "codex weekly window",
-                                rate.get("secondary_window"), plan, hint)
-    if secondary:
-        readings.append(secondary)
+    for slot, fallback, label in [("primary_window", "five_hour", "codex 5-hour window"),
+                                   ("secondary_window", "seven_day", "codex weekly window")]:
+        window = rate.get(slot) or {}
+        seconds = window.get("limit_window_seconds")
+        key = {FIVE_HOUR_SECONDS: "five_hour", SEVEN_DAY_SECONDS: "seven_day"}.get(seconds)
+        if key is None:
+            key = "window_" + str(seconds) if isinstance(seconds, int) and seconds > 0 else fallback
+        reading = _window_reading(key, label if key == fallback else "codex " + key,
+                                  window, plan, hint)
+        if reading:
+            readings.append(reading)
     credits = data.get("credits") or {}
     balance = credits.get("balance")
     if isinstance(balance, (int, float)):

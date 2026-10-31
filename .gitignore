@@ -14,6 +14,7 @@ venv/
 .qpool/
 *.db
 *.db-journal
+*.pre-pools-v1.bak
 qpool.daemon.lock
 
 # OS / editor

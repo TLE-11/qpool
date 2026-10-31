@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from datetime import datetime
 from typing import Any, List, Sequence
 
-from . import ledger
+from . import ledger, pools, profiles
+from .collectors.base import CollectorError
 from .db import Database
 
 # Known upstream OpenAI-compatible provider presets for `cpa register-provider`.
@@ -28,6 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Quota pooling + cost-aware routing control plane for coding agents",
     )
     sub = p.add_subparsers(dest="resource", required=True)
+    web = sub.add_parser("web", help="start the local qpool control panel")
+    web.add_argument("--port", type=int, default=8765)
     quota = sub.add_parser("quota", help="quota ledger operations")
     qsub = quota.add_subparsers(dest="action", required=True)
 
@@ -89,12 +93,21 @@ def build_parser() -> argparse.ArgumentParser:
     rep = qsub.add_parser("report", help="monthly usage + savings report")
     rep.add_argument("--month", help="YYYY-MM (default: current month, UTC)")
 
+    qsub.add_parser("pools", help="show configured pools and account-bound channel readiness")
+    qsub.add_parser("pending", help="show locally retained unattributed CPA receipts")
+    bind = qsub.add_parser("bind", help="explicitly associate a legacy entry with a configured pool")
+    bind.add_argument("id", type=int)
+    bind.add_argument("--pool", required=True)
+    bind.add_argument("--window", required=True)
+    bind.add_argument("--scope", default="*")
+
     syn = qsub.add_parser("sync",
                           help="poll vendor quota APIs via local agent credentials (dry-run unless --apply)")
     syn.add_argument("--agent", help="only sync this agent (default: all with collectors)")
     syn.add_argument("--apply", action="store_true", help="write readings into the ledger")
     syn.add_argument("--account", default="auto",
                      help="account label for auto-created entries (default: auto)")
+    syn.add_argument("--account-id", help="only sync this stable account ID from pools.json")
 
     cpa = qsub.add_parser("cpa", help="CLIProxyAPI control plane (passthrough gateway)")
     cpa_sub = cpa.add_subparsers(dest="cpa_action", required=True)
@@ -131,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="cost: cheapest capable entry (default); capability: strongest first")
     run.add_argument("--dry-run", action="store_true",
                      help="print the dispatch plan without executing")
+    selection = run.add_mutually_exclusive_group()
+    selection.add_argument("--auto-model", action="store_true",
+                           help="use the configured decision service (may incur decision cost, even in dry-run)")
+    selection.add_argument("--group", choices=("regular", "primary"),
+                           help="manually select the required model group")
 
     cpa_sub.add_parser("providers", help="list upstream OpenAI-compatible providers")
     reg = cpa_sub.add_parser("register-provider",
@@ -236,7 +254,7 @@ def cmd_quota_list(db: Database, args: argparse.Namespace) -> None:
         entries.sort(key=lambda e: (-e["capability_tier"], ledger.route_sort_key(e)))
 
     now = ledger.now_utc()
-    headers = ["ID", "AGENT", "ACCOUNT", "KIND", "TIER", "QUOTA", "UNIT", "COST/U", "EXPIRES", "RESET", "STATUS"]
+    headers = ["ID", "AGENT", "ACCOUNT", "POOL", "WINDOW", "SCOPE", "ROLE", "KIND", "TIER", "QUOTA", "UNIT", "COST/U", "EXPIRES/RESETS", "RESET", "STATUS"]
     rows: List[List[Any]] = []
     counts = {ledger.STATUS_ACTIVE: 0, ledger.STATUS_EXPIRING: 0,
               ledger.STATUS_EXPIRED: 0, ledger.STATUS_DEPLETED: 0}
@@ -252,6 +270,8 @@ def cmd_quota_list(db: Database, args: argparse.Namespace) -> None:
             quota = "-"
         if e["expires_at"]:
             expires = human_delta(ledger.parse_dt(e["expires_at"]), now)
+        elif e["resets_at"]:
+            expires = human_delta(ledger.parse_dt(e["resets_at"]), now)
         elif e["window_seconds"] and e["period_start"]:
             from datetime import timedelta as _td
             resets_at = ledger.parse_dt(e["period_start"]) + _td(seconds=e["window_seconds"])
@@ -259,7 +279,8 @@ def cmd_quota_list(db: Database, args: argparse.Namespace) -> None:
         else:
             expires = "-"
         rows.append([
-            e["id"], e["agent"], e["account"], e["kind"], f"T{e['capability_tier']}",
+            e["id"], e["agent"], e["account"], e["pool_id"] or "unbound",
+            e["window_key"] or "-", e["scope"], e["role"], e["kind"], f"T{e['capability_tier']}",
             quota, e["unit"], fmt_cost(e["cost_per_unit"]), expires,
             e["reset_period"] or "-", e["status"],
         ])
@@ -320,43 +341,62 @@ def cmd_quota_events(db: Database, args: argparse.Namespace) -> None:
     print(render_table(headers, body))
 
 
+def render_plan(plan: Any) -> None:
+    print(f"route plan for {fmt_num(plan['amount'])} {plan['unit']}, tier >= T{plan['min_tier']}:")
+    for i, c in enumerate(plan['candidates']):
+        capacity = (f"{fmt_num(c['remaining'])} {plan['unit']} left" if c['coverage'] == 'known'
+                    else 'metered' if c['coverage'] == 'metered' else 'task capacity unknown')
+        print(f"  {'PRIMARY' if i == 0 else 'FALLBACK'} {c['pool_id']} "
+              f"account={c['account_id']} model={c['model']} channel={c['channel_id']} "
+              f"{capacity}; est {fmt_cost(c['est'])}")
+    for c in plan['skipped']:
+        print(f"  SKIP {c.get('pool_id') or c['id']}: {c['why']}")
+    print(f"routed estimate: {fmt_cost(plan['routed_cost'])}; "
+          f"payg reference: {fmt_cost(plan['payg_only_cost'])}; "
+          f"estimated saving: {fmt_cost(plan['saved'])}")
+
+
 def cmd_quota_simulate(db: Database, args: argparse.Namespace) -> None:
-    plan = ledger.plan_route(db, args.amount, args.unit, args.tier,
-                             strategy=args.strategy)
-    print(f"route plan for {fmt_num(plan['amount'])} {plan['unit']}, "
-          f"capability >= T{plan['min_tier']}, strategy={args.strategy}:\n")
-    if not plan["candidates"]:
-        print("  no eligible entries.")
-    for i, c in enumerate(plan["candidates"]):
-        if i == plan["primary_idx"]:
-            role = "PRIMARY "
-        elif plan["primary_idx"] is not None and i > plan["primary_idx"]:
-            role = "FALLBACK"
-        else:
-            role = "NO-COVER"
-        quota = "metered" if c["remaining"] is None else f"{fmt_num(c['remaining'])} left"
-        cover_note = "" if c["covers"] else "  (insufficient alone; failover mid-task)"
-        print(f"  {role}  #{c['id']} {c['agent']}/{c['account']} {c['kind']:<12} "
-              f"T{c['capability_tier']}  {quota:<16} est {fmt_cost(c['est'])}{cover_note}")
-    for s in plan["skipped"]:
-        print(f"  SKIP      #{s['id']} {s['agent']}/{s['account']} {s['kind']:<12} {s['why']}")
-    print("\nthe three bills:")
-    if plan["routed_cost"] is None:
-        print("  routed cost   : no eligible entry can fully cover this amount")
-    else:
-        print(f"  routed cost   : {fmt_cost(plan['routed_cost'])}")
-    if plan["payg_only_cost"] is None:
-        print("  payg-only     : no payg baseline in the ledger for this unit")
-    else:
-        print(f"  payg-only     : {fmt_cost(plan['payg_only_cost'])}")
-    if plan["saved"] is not None:
-        print(f"  saved by pool : {fmt_cost(plan['saved'])}")
+    render_plan(ledger.plan_route(db, args.amount, args.unit, args.tier, strategy=args.strategy))
+
+
+def cmd_quota_pools(db: Database, args: argparse.Namespace) -> None:
+    config = profiles.load()
+    rows = []
+    from .executors import channel_status
+    for pool in config['pools'].values():
+        channels = [c for c in config['channels'] if c['pool_id'] == pool['id']]
+        for channel in channels or [None]:
+            verdict = pools.evaluate(db, pool, channel['model'] if channel else '*')
+            ready, why = channel_status(channel, pool, config) if channel else (False, 'no bound channel')
+            rows.append([pool['id'], pool['account_id'], pool['kind'],
+                         channel['model'] if channel else '-', channel['id'] if channel else '-',
+                         verdict['state'], 'configured' if ready else 'unavailable',
+                         verdict['why'] + ('; ' + why if not ready else '')])
+    print(render_table(['POOL', 'ACCOUNT-ID', 'KIND', 'MODEL', 'CHANNEL', 'QUOTA', 'EXECUTION', 'REASON'], rows))
+    print('Configured checks local profile binding; real-provider execution is not certified by this view.')
+
+
+def cmd_quota_bind(db: Database, args: argparse.Namespace) -> None:
+    import sqlite3
+    try:
+        pools.bind_entry(db, profiles.load(), args.id, args.pool, args.window, args.scope)
+    except sqlite3.IntegrityError as exc:
+        raise ledger.LedgerError('pool/window is already bound; no rows were merged') from exc
+    print(f"bound entry #{args.id} to {args.pool}/{args.scope}/{args.window}")
+
+
+def cmd_quota_pending(db: Database, args: argparse.Namespace) -> None:
+    rows = db.conn.execute("SELECT id, model, amount, reason, occurred_at FROM imported_usage "
+                           "WHERE status='pending' ORDER BY id DESC LIMIT 100").fetchall()
+    print(render_table(['ID', 'MODEL', 'TOKENS', 'REASON', 'WHEN'], [list(r) for r in rows]))
 
 
 def cmd_quota_report(db: Database, args: argparse.Namespace) -> None:
     month = args.month or ledger.now_utc().strftime("%Y-%m")
     rep = ledger.monthly_report(db, month)
     print(f"{rep['month']} usage report (UTC):\n")
+    print(f"  pending receipts: {rep['pending']}; matched receipts with unknown cost: {rep['unknown_cost']}")
     if not rep["rows"]:
         print("  no usage events recorded this month.")
         return
@@ -364,7 +404,7 @@ def cmd_quota_report(db: Database, args: argparse.Namespace) -> None:
     body = [[r["agent"], r["kind"], fmt_num(r["amount"]), r["unit"], r["n"],
              fmt_cost(r["cost"])] for r in rep["rows"]]
     print(render_table(headers, body))
-    print(f"\n  real money spent (payg)       : {fmt_cost(rep['spent'])}")
+    print(f"\n  recorded marginal cost (est.): {fmt_cost(rep['spent'])}")
     print(f"  pooled usage, payg-equivalent : {fmt_cost(rep['pooled_value'])}")
     print(f"  saved by pooling              : {fmt_cost(rep['saved'])}")
     if not rep["baselines"]:
@@ -373,6 +413,24 @@ def cmd_quota_report(db: Database, args: argparse.Namespace) -> None:
 
 def cmd_quota_sync(db: Database, args: argparse.Namespace) -> None:
     from .collectors import COLLECTORS, CollectorError
+
+    config = profiles.load()
+    if config["accounts"] or args.account_id:
+        if args.account != "auto":
+            raise ledger.LedgerError("configured accounts use --account-id; --account is a legacy display label")
+        result = pools.sync_accounts(db, apply=args.apply, agent=args.agent, account_id=args.account_id)
+        rows = [[r["account_id"], r["agent"], reading.window_key,
+                 fmt_num(reading.used_percent), fmt_num(reading.remaining_abs),
+                 str(r["outcome"] or "inspection only")]
+                for r in result["rows"] for reading in r["readings"]]
+        print(render_table(["ACCOUNT-ID", "AGENT", "WINDOW", "USED %", "REMAINING", "RESULT"], rows))
+        for error in result["errors"]:
+            print(f"sync error: {error}", file=sys.stderr)
+        if not args.apply:
+            print("\ninspection only; --apply writes one atomic batch per account")
+        if result["errors"]:
+            raise ledger.LedgerError("one or more account snapshots failed or were incomplete")
+        return
 
     agents = [args.agent] if args.agent else list(COLLECTORS)
     rows: List[List[Any]] = []
@@ -460,7 +518,8 @@ def cmd_quota_cpa(db: Database, args: argparse.Namespace) -> None:
             print(render_table(headers, rows))
             if args.cpa_action == "reconcile" and not do_apply:
                 print("\ndry-run only; re-run with --apply to push decisions "
-                      "(priority + strategy=fill-first included)")
+                      "for verified, exclusively managed bindings")
+            print("Global priority/strategy updates are withheld pending CPA contract verification.")
         elif args.cpa_action == "pull-usage":
             result = conductor.pull_usage(db, cpa, count=args.count)
             print(f"pulled {result['records']} usage record(s) from CLIProxyAPI: "
@@ -529,51 +588,43 @@ def cmd_quota_cpa(db: Database, args: argparse.Namespace) -> None:
 
 
 def cmd_quota_run(db: Database, args: argparse.Namespace) -> None:
-    from . import executors
-
-    plan = ledger.plan_route(db, args.amount, "tokens", args.tier,
-                             unit_compat=True, strategy=args.strategy)
-    chain = []
-    for c in plan["candidates"]:
-        agent = c["agent"]
-        channel = "cli" if agent in executors.CLI_EXECUTORS else "gateway"
-        chain.append((c, agent, channel))
-    if not chain:
-        print("error: no eligible entries with an execution channel.\n"
-              "hint: sync your ledger first (`qpool quota sync --apply`), and map "
-              "agent CLIs in ~/.qpool/executors.json, e.g.\n"
-              '  {"cli": {"<agent-name>": ["<cli-command>", "-p"]}}', file=sys.stderr)
-        sys.exit(1)
-
-    print(f"dispatch plan (~{fmt_num(args.amount)} tokens, tier>=T{args.tier}):")
-    for i, (c, agent, channel) in enumerate(chain):
-        role = "PRIMARY " if i == 0 else "FALLBACK"
-        est = fmt_cost(c["est"])
-        print(f"  {role}  {agent:<12} [{channel}] entry #{c['id']}  est {est}")
+    from . import executors, routing
+    from .tasks import workspace_lock
+    if args.timeout <= 0 or args.max_cost is not None and (not math.isfinite(args.max_cost) or args.max_cost < 0):
+        raise ledger.LedgerError('positive timeout and nonnegative max-cost required')
+    mode = "auto" if args.auto_model else args.group or "manual"
+    plan = routing.plan_task(db, args.task, mode=mode, amount=args.amount,
+                             min_tier=args.tier, strategy=args.strategy, max_cost=args.max_cost)
+    if mode != "manual":
+        decision = plan['decision']
+        print(f"model decision: {decision['group']} ({decision['source']}); {decision['reason']}")
+    render_plan(plan)
     if args.dry_run:
-        print("\ndry-run only; re-run without --dry-run to execute")
         return
+    if not plan['candidates']:
+        raise ledger.LedgerError('no eligible account-bound execution channels; see skipped reasons')
+    with workspace_lock(args.cwd, db.path) as cwd:
+        _execute_plan(db, args, plan, cwd)
 
-    for c, agent, channel in chain:
-        est_cost = c["est"]
-        if args.max_cost is not None and c["kind"] == "payg" and est_cost > args.max_cost:
-            print(f"skip {agent}: est {fmt_cost(est_cost)} exceeds --max-cost")
+
+def _execute_plan(db: Database, args: argparse.Namespace, plan: Any, cwd: str) -> None:
+    from . import executors
+    for c in plan['candidates']:
+        if args.max_cost is not None and (c['est'] is None or c['est'] > args.max_cost):
+            print(f"skip {c['channel_id']}: estimated cost unknown or above --max-cost")
             continue
-        print(f"\n→ trying {agent} [{channel}] (est {fmt_cost(est_cost)})...", flush=True)
-        result = executors.execute(agent, args.task, cwd=args.cwd, timeout=args.timeout)
+        result = executors.execute(c, args.task, db=db, cwd=cwd, timeout=args.timeout)
         if result.success:
             if result.output.strip():
                 print(result.output.rstrip())
-            print(f"\n✓ completed via {agent} in {result.duration_s:.1f}s")
-            if channel == "cli":
-                print(f"  usage will appear in the ledger after `qpool quota sync --apply`")
-            else:
-                print(f"  book it now with `qpool quota cpa pull-usage`")
+            print(f"completed: account={c['account_id']} pool={c['pool_id']} "
+                  f"model={c['model']} channel={c['channel_id']} ({result.duration_s:.1f}s)")
+            print('Quota is confirmed on the next sync; CLI success does not certify task quality.')
             return
-        print(f"✗ {agent} failed ({result.error.strip()[:160] or 'unknown error'}); "
-              f"failing over...", flush=True)
-    print("error: every candidate failed; see messages above", file=sys.stderr)
-    sys.exit(1)
+        print(f"failed {c['channel_id']}: {result.error}")
+        if not result.retry_safe:
+            raise ledger.LedgerError('execution started; automatic cross-agent retry stopped')
+    raise ledger.LedgerError('all candidates failed preflight or exceeded the cost estimate limit')
 
 
 def cmd_quota_daemon(db: Database, args: argparse.Namespace) -> None:
@@ -626,8 +677,21 @@ def cmd_quota_daemon(db: Database, args: argparse.Namespace) -> None:
 
 def main(argv: Any = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.resource == "web":
+        from .web import serve
+        try:
+            if not 0 <= args.port <= 65535:
+                raise ledger.LedgerError("port must be between 0 and 65535")
+            serve(args.port)
+        except (ledger.LedgerError, CollectorError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
     handlers = {
         ("quota", "add"): cmd_quota_add,
+        ("quota", "pools"): cmd_quota_pools,
+        ("quota", "bind"): cmd_quota_bind,
+        ("quota", "pending"): cmd_quota_pending,
         ("quota", "list"): cmd_quota_list,
         ("quota", "consume"): cmd_quota_consume,
         ("quota", "remove"): cmd_quota_remove,
@@ -642,7 +706,7 @@ def main(argv: Any = None) -> None:
     db = Database()
     try:
         handlers[(args.resource, args.action)](db, args)
-    except ledger.LedgerError as exc:
+    except (ledger.LedgerError, CollectorError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:

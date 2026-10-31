@@ -1,26 +1,20 @@
-"""Executors: actually dispatch a task to the selected agent.
-
-This is the execution half of cost-aware routing (the other half being
-plan_route's candidate chain). Two channel types:
-
-- CLI headless: agent CLIs that support non-interactive print mode,
-  configured per-user in ~/.qpool/executors.json (the repo ships no
-  agent-to-CLI mappings). Usage flows back into the ledger on the next
-  `quota sync --apply` via transcript collectors.
-- gateway: OpenAI-compatible upstreams behind CLIProxyAPI (e.g. doubao/ark).
-  Usage flows back via `quota cpa pull-usage`.
-"""
+"""Execute explicitly bound local profiles. Unverified gateway pinning stays unavailable."""
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .collectors.base import CollectorError, http_json
+from .collectors.base import CollectorError
+from . import profiles
 
 def _load_cli_executors() -> Dict[str, List[str]]:
     """CLI executors from ~/.qpool/executors.json.
@@ -46,20 +40,7 @@ def _load_cli_executors() -> Dict[str, List[str]]:
     return executors
 
 
-CLI_EXECUTORS = _load_cli_executors()
-
-# Substrings in output that mean "this candidate is unusable right now"
-# (quota exhausted, auth broke, rate limited) -> fail over to the next one.
-FAIL_PATTERNS = (
-    "authentication required",
-    "usage limit",
-    "rate limit",
-    "quota exceeded",
-    "insufficient",
-    "credits exhausted",
-    "402",
-    "429",
-)
+CLI_EXECUTORS: Dict[str, List[str]] = {}  # legacy mappings are inspected lazily
 
 DEFAULT_TIMEOUT_S = 900
 
@@ -73,103 +54,127 @@ class ExecResult:
     error: str
     returncode: int
     duration_s: float
+    retry_safe: bool = False
 
 
-def _looks_failed(text: str) -> bool:
-    lowered = text.lower()
-    return any(p in lowered for p in FAIL_PATTERNS)
+def execution_env(channel: Dict[str, Any], pool: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, str]:
+    env = dict(os.environ, **channel.get("env", {}))
+    # Ambient API auth/endpoint overrides must not defeat a selected OAuth profile.
+    overrides = {"codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_TOKEN", "OPENAI_BASE_URL"),
+                 "claude-code": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL")}
+    for key in overrides.get(pool["agent"], ()):
+        env.pop(key, None)
+    source = config["accounts"][pool["account_id"]]["source"]
+    env[source["profile_env"]] = str(Path(source["profile_dir"]).expanduser().resolve())
+    return env
 
 
-def _run_cli(agent: str, task: str, cwd: Optional[str], timeout: int) -> ExecResult:
-    cmd = CLI_EXECUTORS[agent] + [task]
-    started = time.time()
+def channel_status(channel: Dict[str, Any], pool: Dict[str, Any],
+                   config: Dict[str, Any]) -> Any:
+    if channel.get("pool_id") != pool["id"] or channel.get("account_id") != pool["account_id"]:
+        return False, "channel account/pool mismatch"
+    if channel.get("type") != "cli":
+        return False, "gateway account/funding pinning is not verified in this version"
+    if len([p for p in config["pools"].values() if p["account_id"] == pool["account_id"]]) != 1:
+        return False, "CLI funding selection is unverified for accounts with multiple pools"
+    command = channel.get("command")
+    if not isinstance(command, list) or not command or not all(isinstance(v, str) for v in command):
+        return False, "CLI command is missing"
+    if not any("{task}" in v for v in command) or not any("{model}" in v for v in command):
+        return False, "CLI command must bind {task} and {model} explicitly"
+    account = config["accounts"][pool["account_id"]]
+    source = account["source"]
+    env = channel.get("env", {})
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        return False, "invalid CLI environment"
+    profile_env, directory = source.get("profile_env"), source.get("profile_dir")
+    if not profile_env or not directory or not source.get("credentials_file"):
+        return False, "CLI needs a credential file and an explicit isolated profile environment"
+    root = Path(directory).expanduser().resolve()
+    if not env.get(profile_env) or Path(env[profile_env]).expanduser().resolve() != root:
+        return False, "CLI environment does not select the account's profile"
     try:
-        proc = subprocess.run(
-            cmd, cwd=cwd or None, timeout=timeout,
-            capture_output=True, text=True,
-        )
+        Path(source["credentials_file"]).expanduser().resolve().relative_to(root)
+        # File identity is checked on every plan and once more before process creation.
+        profiles.credentials(account, None)
+    except (ValueError, CollectorError):
+        return False, "CLI credential identity is missing or changed"
+    run_env = execution_env(channel, pool, config)
+    if not shutil.which(command[0], path=run_env.get("PATH")):
+        return False, "CLI executable not found"
+    return True, "configured account profile and model are bound; capacity is not reserved"
+
+
+def execute(candidate: Dict[str, Any], task: str, *, db: Any,
+            cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT_S) -> ExecResult:
+    """Execute the exact frozen channel, never an agent's ambient default account."""
+    from .pools import evaluate
+
+    started = time.time()
+    process_started = False
+
+    def failure(reason: str, safe: bool = True) -> ExecResult:
+        return ExecResult(candidate["agent"], candidate["channel"]["type"], False,
+                          "", reason, 1, time.time() - started, safe)
+
+    try:
+        config = profiles.load()
+        pool = config["pools"].get(candidate["pool_id"])
+        channel = next((c for c in config["channels"] if c["id"] == candidate["channel_id"]), None)
+        if (not pool or channel != candidate["channel"]
+                or pool != candidate.get("pool_config", {k: candidate[k] for k in pool if k in candidate})):
+            return failure("configuration changed since planning; re-plan required")
+        verdict = evaluate(db, pool, channel["model"], amount=candidate["task_amount"],
+                           unit=candidate["task_unit"])
+        ready, reason = channel_status(channel, pool, config)
+        if verdict["state"] != "ready" or not ready:
+            return failure(verdict["why"] if verdict["state"] != "ready" else reason)
+        command = [v.replace("{model}", channel["model"]).replace("{task}", task)
+                   for v in channel["command"]]
+        env = execution_env(channel, pool, config)
+        command[0] = str(Path(shutil.which(command[0], path=env.get("PATH")) or command[0]).resolve())
+        # Spool output instead of retaining an unbounded CLI transcript in memory.
+        # The local UI only needs a bounded completed-output tail.
+        with tempfile.TemporaryFile() as output:
+            proc = subprocess.Popen(command, cwd=cwd, stdout=output, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+            process_started = True
+            deadline = time.monotonic() + timeout
+            try:
+                while proc.poll() is None:
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    if os.fstat(output.fileno()).st_size > 16 * 1024 * 1024:
+                        return failure("CLI output exceeded 16 MiB; inspect workspace before retry", False)
+                    time.sleep(0.05)
+            finally:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
+            size = os.fstat(output.fileno()).st_size
+            output.seek(max(0, size - 262144))
+            captured = output.read(262144).decode("utf-8", errors="replace")
+            if size > 262144:
+                captured = "[Earlier output omitted; showing last 256 KiB]\n" + captured
+    except (CollectorError, KeyError):
+        return failure("execution binding cannot be verified; re-plan required")
     except FileNotFoundError:
-        return ExecResult(agent, "cli", False, "",
-                          f"{cmd[0]} not found on PATH", 127, time.time() - started)
+        return failure("CLI file disappeared; inspect workspace before retry" if process_started
+                       else "CLI executable disappeared before launch", not process_started)
     except subprocess.TimeoutExpired:
-        return ExecResult(agent, "cli", False, "",
-                          f"timeout after {timeout}s", 124, time.time() - started)
-    output = (proc.stdout or "") + (proc.stderr or "")
-    failed = proc.returncode != 0 or _looks_failed(output)
-    return ExecResult(
-        agent, "cli", not failed, proc.stdout or "",
-        (proc.stderr or output)[-400:] if failed else "",
-        proc.returncode, time.time() - started,
-    )
-
-
-def _gateway_model_for(cpa: Any, agent: str) -> Optional[str]:
-    """Pick the first registered model alias for an openai-compat upstream."""
-    for p in cpa.list_openai_providers():
-        if p.get("name") == agent:
-            for m in p.get("models") or []:
-                alias = m.get("alias") or m.get("name")
-                if alias:
-                    return alias
-    return None
-
-
-def _run_gateway(agent: str, task: str, timeout: int) -> ExecResult:
-    from .cpa import CpaClient
-
-    started = time.time()
-    cpa = CpaClient.from_env()
-    if not cpa.available():
-        return ExecResult(agent, "gateway", False, "",
-                          "no CLIProxyAPI management key (QPOOL_CPA_KEY)", 0,
-                          time.time() - started)
-    model = _gateway_model_for(cpa, agent)
-    if not model:
-        return ExecResult(agent, "gateway", False, "",
-                          f"no registered model for upstream '{agent}'; "
-                          f"run `qpool quota cpa register-provider` first", 0,
-                          time.time() - started)
-    api_keys = cpa._request("GET", "/api-keys") or {}
-    keys = api_keys.get("api-keys") or []
-    if not keys:
-        return ExecResult(agent, "gateway", False, "",
-                          "CLIProxyAPI has no downstream api-keys configured", 0,
-                          time.time() - started)
-    try:
-        data = http_json(
-            f"{cpa.base_url}/v1/chat/completions",
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {keys[0]}",
-                "Content-Type": "application/json",
-            },
-            body=json.dumps({
-                "model": model,
-                "messages": [{"role": "user", "content": task}],
-            }).encode("utf-8"),
-            timeout=timeout,
-        )
-    except CollectorError as exc:
-        return ExecResult(agent, "gateway", False, "", str(exc), 0,
-                          time.time() - started)
-    choices = data.get("choices") or []
-    text = ""
-    if choices:
-        text = ((choices[0].get("message") or {}).get("content")) or ""
-    failed = _looks_failed(text) if not text else False
-    return ExecResult(agent, "gateway", not failed, text,
-                      "" if text else "empty completion", 0, time.time() - started)
-
-
-def execute(agent: str, task: str, *, cwd: Optional[str] = None,
-            timeout: int = DEFAULT_TIMEOUT_S) -> ExecResult:
-    """Dispatch `task` to `agent` over its execution channel."""
-    if agent in CLI_EXECUTORS:
-        return _run_cli(agent, task, cwd, timeout)
-    return _run_gateway(agent, task, timeout)
+        return failure("CLI timed out after starting; inspect workspace before retry", False)
+    except OSError:
+        return failure("CLI I/O failed after starting; inspect workspace before retry" if process_started
+                       else "CLI could not start", not process_started)
+    failed = proc.returncode != 0
+    return ExecResult(candidate["agent"], "cli", not failed, captured,
+                      "CLI failed after starting; inspect workspace before retry" if failed else "",
+                      proc.returncode, time.time() - started, False)
 
 
 def executable_agents() -> List[str]:
-    """Agents with a known execution channel (CLI executors; gateway upstreams
-    are validated at runtime)."""
-    return sorted(CLI_EXECUTORS)
+    """Legacy configuration remains readable, but is not an account-bound channel."""
+    return sorted(_load_cli_executors())

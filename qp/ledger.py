@@ -12,6 +12,7 @@ Borrowed ideas:
 from __future__ import annotations
 
 import calendar
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -91,7 +92,8 @@ def entry_status(entry: Any, now: datetime) -> str:
     remaining = entry["remaining"]
     # depleted requires a real total; negative remaining with total=NULL is
     # net-consumption bookkeeping (consumption-only collectors), not exhaustion
-    if remaining is not None and remaining <= 0 and entry["total"]:
+    if ((remaining is not None and remaining <= 0 and (entry["total"] is not None or entry["kind"] == "credit_pack"))
+            or (entry["used_percent"] is not None and entry["used_percent"] >= 100)):
         return STATUS_DEPLETED
     if exp_raw and parse_dt(exp_raw) <= now + timedelta(days=EXPIRING_SOON_DAYS):
         return STATUS_EXPIRING
@@ -134,6 +136,8 @@ def apply_due_resets(db: Database) -> int:
     ).fetchall()
     reset = 0
     for row in rows:
+        if row["source_kind"] == "snapshot" or row["last_synced_at"]:
+            continue  # vendor resets need a new observation, never local replenishment
         new_start = _next_reset_start(row, now)
         if new_start is None:
             continue
@@ -186,6 +190,8 @@ def add_entry(
         raise LedgerError("total must be > 0")
     if cost_per_unit < 0:
         raise LedgerError("cost per unit must be >= 0")
+    if any(v is not None and not math.isfinite(v) for v in (total, remaining, cost_per_unit)):
+        raise LedgerError("quota amounts and prices must be finite")
 
     if kind == "subscription":
         if total is None:
@@ -292,12 +298,14 @@ def consume(
     note: Optional[str] = None,
     force: bool = False,
 ) -> Dict[str, Any]:
-    if amount <= 0:
+    if not math.isfinite(amount) or amount <= 0:
         raise LedgerError("amount must be > 0")
     apply_due_resets(db)
     row = db.conn.execute("SELECT * FROM quota_entries WHERE id = ?", (entry_id,)).fetchone()
     if row is None:
         raise LedgerError(f"quota entry #{entry_id} not found")
+    if row["source_kind"] == "snapshot" or row["last_synced_at"]:
+        raise LedgerError("vendor snapshots are read-only; record request usage separately")
     now = now_utc()
     remaining = row["remaining"]
     if not force:
@@ -360,71 +368,31 @@ def list_events(db: Database, *, entry_id: Optional[int] = None, limit: int = 50
         params.append(entry_id)
     sql += " ORDER BY e.id DESC LIMIT ?"
     params.append(limit)
-    return db.conn.execute(sql, params).fetchall()
+    rows = [dict(r) for r in db.conn.execute(sql, params)]
+    if entry_id is None:
+        rows.extend(dict(r) for r in db.conn.execute("""SELECT 'cpa:' || u.id AS id,
+            NULL AS entry_id, p.agent, p.account_label AS account, u.amount, 'tokens' AS unit,
+            u.est_cost_usd, u.input_tokens, u.output_tokens, u.cached_tokens,
+            NULL AS tool_calls, u.request_id AS task_ref, 'CPA receipt (snapshot unchanged)' AS note,
+            u.occurred_at AS created_at FROM imported_usage u JOIN quota_pools p ON p.id=u.pool_id
+            WHERE u.status='matched' ORDER BY u.occurred_at DESC, u.id DESC LIMIT ?""", (limit,)))
+    return sorted(rows, key=lambda r: (r["created_at"], str(r["id"])), reverse=True)[:limit]
 
 
 # ---------- routing simulation & reports ----------
 
-# Units treated as interchangeable for coding tasks (credits are vendor
-# wrappers around token metering).
+# Units have vendor-specific meanings; no implicit conversion is safe.
 UNIT_COMPAT = {
-    "tokens": {"tokens", "credits"},
-    "credits": {"credits", "tokens"},
+    "tokens": {"tokens"},
+    "credits": {"credits"},
 }
 
 
 def plan_route(db: Database, amount: float, unit: str, min_tier: int = 1,
                unit_compat: bool = False, strategy: str = "cost") -> Dict[str, Any]:
-    """Dry-run routing: capability hard filter -> ordering by `strategy`.
-
-    strategy="cost" (default): cheapest entry that meets the tier floor wins.
-    strategy="capability": strongest entry wins, cost only breaks ties.
-    Returns the failover chain plus the "three bills".
-    """
-    if amount <= 0:
-        raise LedgerError("amount must be > 0")
-    if not 1 <= min_tier <= 5:
-        raise LedgerError("tier must be between 1 and 5")
-    if strategy not in STRATEGIES:
-        raise LedgerError(f"strategy must be one of: {', '.join(STRATEGIES)}")
-    apply_due_resets(db)
-    entries = list_entries(db)
-    accepted_units = UNIT_COMPAT.get(unit, {unit}) if unit_compat else {unit}
-    candidates: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-    payg_prices: List[float] = []
-    for e in entries:
-        if e["unit"] not in accepted_units:
-            skipped.append(dict(e) | {"why": f"unit mismatch ({e['unit']} != {unit})"})
-            continue
-        if e["capability_tier"] < min_tier:
-            skipped.append(dict(e) | {"why": f"tier T{e['capability_tier']} < required T{min_tier}"})
-            continue
-        if e["kind"] == "payg" and e["cost_per_unit"] > 0:
-            payg_prices.append(e["cost_per_unit"])
-        if e["status"] in (STATUS_EXPIRED, STATUS_DEPLETED):
-            skipped.append(dict(e) | {"why": e["status"]})
-            continue
-        remaining = e["remaining"]
-        candidates.append(dict(e) | {
-            "covers": remaining is None or remaining >= amount,
-            "est": amount * e["cost_per_unit"],
-        })
-    candidates.sort(key=capability_sort_key if strategy == "capability" else route_sort_key)
-    primary_idx = next((i for i, c in enumerate(candidates) if c["covers"]), None)
-    payg_only = amount * min(payg_prices) if payg_prices else None
-    routed = candidates[primary_idx]["est"] if primary_idx is not None else None
-    return {
-        "amount": amount,
-        "unit": unit,
-        "min_tier": min_tier,
-        "candidates": candidates,
-        "primary_idx": primary_idx,
-        "skipped": skipped,
-        "routed_cost": routed,
-        "payg_only_cost": payg_only,
-        "saved": None if (routed is None or payg_only is None) else payg_only - routed,
-    }
+    """Plan actual account-bound channels; unit_compat is retained for callers."""
+    from .pools import plan_route as pool_plan
+    return pool_plan(db, amount, unit, min_tier, strategy)
 
 
 def monthly_report(db: Database, month: str) -> Dict[str, Any]:
@@ -436,7 +404,7 @@ def monthly_report(db: Database, month: str) -> Dict[str, Any]:
     """
     if len(month) != 7 or month[4] != "-":
         raise LedgerError("month must be YYYY-MM")
-    rows = db.conn.execute(
+    rows = [dict(r) for r in db.conn.execute(
         """SELECT q.agent, q.kind, q.unit,
                   SUM(e.amount) AS amount, SUM(e.est_cost_usd) AS cost, COUNT(*) AS n
            FROM usage_events e JOIN quota_entries q ON q.id = e.entry_id
@@ -444,7 +412,13 @@ def monthly_report(db: Database, month: str) -> Dict[str, Any]:
            GROUP BY q.agent, q.kind, q.unit
            ORDER BY q.agent, q.kind""",
         (month,),
-    ).fetchall()
+    ).fetchall()]
+    imported = db.conn.execute("""SELECT p.agent, p.kind, 'tokens' AS unit,
+        SUM(u.amount) AS amount, SUM(u.est_cost_usd) AS cost, COUNT(*) AS n
+        FROM imported_usage u JOIN quota_pools p ON p.id=u.pool_id
+        WHERE u.status='matched' AND substr(u.occurred_at, 1, 7)=?
+        GROUP BY p.agent, p.kind""", (month,)).fetchall()
+    rows.extend(dict(r) for r in imported)
     baselines = {
         r["unit"]: r["c"]
         for r in db.conn.execute(
@@ -452,6 +426,8 @@ def monthly_report(db: Database, month: str) -> Dict[str, Any]:
             "WHERE kind = 'payg' AND cost_per_unit > 0 GROUP BY unit"
         )
     }
+    for pool in db.conn.execute("SELECT unit, MIN(cost_per_unit) AS c FROM quota_pools WHERE kind='payg' GROUP BY unit"):
+        baselines[pool["unit"]] = min(baselines.get(pool["unit"], pool["c"]), pool["c"])
     spent = sum(r["cost"] or 0.0 for r in rows)
     pooled_value = 0.0  # payg-equivalent value of subscription / credit-pack usage
     for r in rows:
@@ -467,6 +443,8 @@ def monthly_report(db: Database, month: str) -> Dict[str, Any]:
         "spent": spent,
         "pooled_value": pooled_value,
         "saved": pooled_value,  # pooled usage cost ~0 marginally; on payg it would be this
+        "pending": db.conn.execute("SELECT COUNT(*) FROM imported_usage WHERE status='pending' AND substr(occurred_at,1,7)=?", (month,)).fetchone()[0],
+        "unknown_cost": db.conn.execute("SELECT COUNT(*) FROM imported_usage WHERE status='matched' AND est_cost_usd IS NULL AND substr(occurred_at,1,7)=?", (month,)).fetchone()[0],
     }
 
 
@@ -475,14 +453,20 @@ def monthly_report(db: Database, month: str) -> Dict[str, Any]:
 def upsert_reading(db: Database, reading: Any, account_label: str = "auto") -> Dict[str, Any]:
     """Upsert one collector QuotaReading into the ledger.
 
-    Match key: (agent, window_key). Creates a percentage-based entry when the API
+    Legacy display match key: (agent, account label, window_key). Creates a percentage-based entry when the API
     only reports utilization (total unknown); calibrates remaining against the
     manually estimated total when one exists.
     """
+    # Unconfigured collectors remain a display-only compatibility path. Never
+    # merge account changes or promote display hints to verified execution IDs.
+    if account_label == "auto":
+        if not reading.account_hint:
+            raise LedgerError("account identity unavailable; configure pools.json before applying readings")
+        account_label = "auto:" + str(reading.account_hint)
     now = now_utc()
     row = db.conn.execute(
-        "SELECT * FROM quota_entries WHERE agent = ? AND window_key = ? ORDER BY id LIMIT 1",
-        (reading.agent, reading.window_key),
+        "SELECT * FROM quota_entries WHERE agent = ? AND account = ? AND window_key = ? AND pool_id IS NULL ORDER BY id LIMIT 1",
+        (reading.agent, account_label, reading.window_key),
     ).fetchone()
     period_start = None
     if reading.resets_at and reading.window_seconds:

@@ -1,0 +1,81 @@
+{
+  "accounts": [
+    {
+      "id": "codex-work",
+      "agent": "codex",
+      "label": "Work",
+      "source": {
+        "credentials_file": "/absolute/path/to/work-codex/auth.json",
+        "fields": {
+          "access_token": "tokens.access_token",
+          "account_id": "tokens.account_id"
+        },
+        "subject_field": "account_id",
+        "expected_subject": "REPLACE_WITH_WORK_ACCOUNT_ID",
+        "profile_env": "CODEX_HOME",
+        "profile_dir": "/absolute/path/to/work-codex"
+      },
+      "pools": [
+        {
+          "id": "work-subscription",
+          "kind": "subscription",
+          "unit": "requests",
+          "capability_tier": 4,
+          "max_age_seconds": 120,
+          "windows": [
+            {"key": "five_hour", "scope": "*", "role": "limit"},
+            {"key": "seven_day", "scope": "*", "role": "limit"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "codex-personal",
+      "agent": "codex",
+      "label": "Personal",
+      "source": {
+        "credentials_file": "/absolute/path/to/personal-codex/auth.json",
+        "fields": {
+          "access_token": "tokens.access_token",
+          "account_id": "tokens.account_id"
+        },
+        "subject_field": "account_id",
+        "expected_subject": "REPLACE_WITH_PERSONAL_ACCOUNT_ID",
+        "profile_env": "CODEX_HOME",
+        "profile_dir": "/absolute/path/to/personal-codex"
+      },
+      "pools": [
+        {
+          "id": "personal-subscription",
+          "kind": "subscription",
+          "unit": "requests",
+          "capability_tier": 4,
+          "windows": [
+            {"key": "five_hour"},
+            {"key": "seven_day"}
+          ]
+        }
+      ]
+    }
+  ],
+  "channels": [
+    {
+      "id": "work-cli",
+      "account_id": "codex-work",
+      "pool_id": "work-subscription",
+      "type": "cli",
+      "model": "YOUR_MODEL_ID",
+      "command": ["codex", "exec", "--ignore-user-config", "--model", "{model}", "--sandbox", "read-only", "{task}"],
+      "env": {"CODEX_HOME": "/absolute/path/to/work-codex"}
+    },
+    {
+      "id": "personal-cli",
+      "account_id": "codex-personal",
+      "pool_id": "personal-subscription",
+      "type": "cli",
+      "model": "YOUR_MODEL_ID",
+      "command": ["codex", "exec", "--ignore-user-config", "--model", "{model}", "--sandbox", "read-only", "{task}"],
+      "env": {"CODEX_HOME": "/absolute/path/to/personal-codex"}
+    }
+  ]
+}
