@@ -130,6 +130,21 @@ def read_body(handler):
     return body
 
 
+def legacy_account(native, session, subject):
+    """Reuse old OpenAI bindings only for the authenticated original identity."""
+    from . import profiles
+    from .collectors import codex
+    with native.receipts() as db:
+        saved = db.execute('SELECT account FROM legacy_bindings WHERE session=?', (session,)).fetchone()
+    if not saved:
+        return None
+    account = profiles.load()['accounts'].get(saved['account'])
+    if (not account or account['agent'] != 'codex' or
+            profiles.credentials(account, codex).get('account_id') != subject):
+        raise CollectorError('旧聊天的原账号与当前原生登录不一致，请恢复原账号后继续')
+    return saved['account']
+
+
 def select_mode(native, session, body, subject, compact=False, headers=None):
     """Keep tools, retries and compaction on the original mode, including after restart."""
     items = body.get('input', [])
@@ -203,6 +218,9 @@ def handle(handler, path):
         session = hashlib.sha256(raw_session.encode()).hexdigest()[:16]
         compact = path.endswith('/compact')
         with native.turn_lock(('desktop-switch', session)):
+            # Check before persisting a turn pin, in either mode. A rejected
+            # login must not prevent the original account from retrying.
+            old_account = legacy_account(native, session, subject)
             # Approval calls are owned by the native login and must never enter
             # automatic model/account selection or overwrite the user's turn pin.
             if body.get('model') == 'codex-auto-review':
@@ -219,7 +237,8 @@ def handle(handler, path):
                                       body, session, subject)
             from . import gateway
             return gateway.handle(handler, path.replace(PREFIX, '/v1', 1), switch_body=body,
-                                  switch_model=model, switch_turn=protocol_turn, switch_compact=compact)
+                                  switch_model=model, switch_turn=protocol_turn, switch_compact=compact,
+                                  switch_legacy_account=old_account)
     except sqlite3.Error:
         native.audit_error = '桌面请求记录写入失败，请检查磁盘与权限后重启服务'
         handler.respond(502, {'error': {'message': native.audit_error}})

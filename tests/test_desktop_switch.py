@@ -251,6 +251,85 @@ class HotSwitchTests(unittest.TestCase):
             desktop.connect(self.native)
         self.assertEqual(self.config, (self.home / 'config.toml').read_bytes())
 
+    def upgrade_legacy_chat(self):
+        desktop.restore(self.native)
+        desktop.connect(self.native)
+        body = self.body()
+        body['input'].insert(0, {'type': 'reasoning', 'encrypted_content': 'synthetic-old-history'})
+        self.assertEqual(200, self.request(body, path='/legacy/v1/responses')[0])
+        self.assertEqual('gpt-test-large', self.requests[-1][1]['model'])
+        desktop.restore(self.native)
+        desktop_switch.connect(self.native)
+        self.config = (self.home / 'config.toml').read_bytes()
+        return body
+
+    def test_upgraded_legacy_chat_switches_both_ways_and_keeps_account(self):
+        body = self.upgrade_legacy_chat()
+        self.native.bindings.clear()  # Exercise the persisted pre-upgrade binding.
+        for mode in ('native', 'qpool', 'native', 'qpool'):
+            self.mode(mode)
+            body = self.new_turn(body, '翻译 continue after upgrade')
+            status, raw = self.request(body)
+            self.assertEqual(200, status, raw)
+            self.assert_direct() if mode == 'native' else self.assert_pool()
+            self.assertEqual(body['input'], self.requests[-1][1]['input'])
+            self.native.bindings.clear()
+        self.mode('native')
+        body['input'].append({'type': 'function_call_output', 'call_id': 'upgrade-tool', 'output': 'ok'})
+        self.assertEqual(200, self.request(body)[0]); self.assert_pool()
+        self.native.bindings.clear()
+        self.assertEqual(200, self.request(body, path='/switch/v1/responses/compact')[0])
+        self.assertEqual('gpt-test-small', self.requests[-1][1]['model'])
+        self.assertEqual(200, self.request(self.new_turn(body, 'next turn'))[0]); self.assert_direct()
+        with self.native.receipts() as db:
+            saved = db.execute('SELECT * FROM legacy_bindings').fetchone()
+            self.assertEqual(self.aid, saved['account'])
+            self.assertEqual(self.aid, json.loads(saved['binding'])['channel']['account_id'])
+            self.assertEqual(0, db.execute('SELECT count(*) FROM session_bindings').fetchone()[0])
+
+    def test_upgraded_legacy_chat_rejects_changed_identity_before_first_switch(self):
+        from qp import profiles
+        body = self.upgrade_legacy_chat()
+        self.native.bindings.clear()
+        # Keep the pool's old credentials valid: reject the different native
+        # identity, not merely a stale credential reference after sign-in.
+        old_login = self.root / 'old-login.json'
+        old_login.write_bytes((self.home / 'auth.json').read_bytes())
+        config = json.loads(profiles.config_path().read_text())
+        account = next(a for a in config['accounts'] if a['id'] == self.aid)
+        account['source']['credentials_file'] = str(old_login)
+        profiles.config_path().write_text(json.dumps(config))
+        (self.home / 'auth.json').write_text(json.dumps({'tokens': {
+            'account_id': 'other-subject', 'access_token': 'other-synthetic-token'}}))
+        for mode in ('qpool', 'native'):
+            self.mode(mode)
+            self.assertEqual(502, self.request(self.new_turn(body, 'next'), token='other-synthetic-token')[0])
+        self.assertEqual(1, len(self.requests))
+        with self.native.receipts() as db:
+            self.assertEqual(self.aid, db.execute('SELECT account FROM legacy_bindings').fetchone()[0])
+            self.assertEqual(0, db.execute('SELECT count(*) FROM session_bindings').fetchone()[0])
+            self.assertEqual(0, db.execute('SELECT count(*) FROM desktop_turns').fetchone()[0])
+        (self.home / 'auth.json').write_bytes(old_login.read_bytes())
+        self.mode('qpool')
+        self.assertEqual(200, self.request(self.new_turn(body, '翻译 retry with original login'))[0])
+        self.assert_pool()
+
+    def test_upgraded_legacy_chat_keeps_route_and_entry_isolation(self):
+        from test_native import NativeTests
+        body = self.upgrade_legacy_chat()
+        # A qpool bearer alone still cannot take over this old native chat.
+        self.assertEqual(502, NativeTests.request(self, dict(body, model='qpool-auto'))[0])
+        changed = self.native.save_route({'name': 'other route', 'mode': 'fixed',
+                                          'regular': [], 'primary': [self.large]})
+        self.native.enable(changed['id'])
+        self.assertEqual(502, self.request(self.new_turn(body, 'next'))[0])
+        self.assertEqual(1, len(self.requests))
+        with self.native.receipts() as db:
+            self.assertEqual(self.route['id'], db.execute('SELECT route FROM legacy_bindings').fetchone()[0])
+        self.native.enable(self.route['id'])
+        self.assertEqual(200, self.request(self.new_turn(body, '翻译 retry after restoring route'))[0])
+        self.assert_pool()
+
     def test_image_only_task_can_use_qpool_mode(self):
         body = self.body(); body['input'][0]['content'] = [{'type': 'input_image', 'image_url': 'data:image/png;base64,dGVzdA=='}]
         self.assertEqual(200, self.request(body)[0])

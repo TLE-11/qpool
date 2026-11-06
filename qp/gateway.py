@@ -12,7 +12,8 @@ from . import profiles, openai_account, desktop
 from .collectors.base import CollectorError
 
 
-def handle(handler, path, *, switch_body=None, switch_model=None, switch_turn=None, switch_compact=False):
+def handle(handler, path, *, switch_body=None, switch_model=None, switch_turn=None, switch_compact=False,
+           switch_legacy_account=None):
     native = handler.server.console.native
     authorization = handler.headers.get('Authorization', '')
     grant = native.grant
@@ -78,6 +79,7 @@ def handle(handler, path, *, switch_body=None, switch_model=None, switch_turn=No
             selection = {'legacy_account': legacy_account} if legacy else {}
             if switch_body is not None:
                 selection['protocol_turn'] = switch_turn
+                selection['legacy_account'] = switch_legacy_account
             binding, session = native.select(body, handler.headers, path.endswith('/compact') or switch_compact, **selection)
         channel = binding['channel']
         if switch_body is not None:
