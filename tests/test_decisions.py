@@ -62,6 +62,7 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual('gpt-test-small',sent['model'])
         self.assertEqual('Bearer private-adapter-key',headers['Authorization'])
         self.assertEqual([],sent['tools'])
+        self.assertEqual(decisions.SCORE_FORMAT,sent['text']['format'])
         state=json.loads(sent['input'][0]['content'][0]['text'])
         self.assertEqual('score',state['questions']['q0']['type'])
         self.assertEqual(2,len(state['questions']['q0']['criteria']))
@@ -76,6 +77,26 @@ class DecisionTests(unittest.TestCase):
         self.request(self.body('翻译 hello'))
         self.assertEqual('gpt-test-large',self.requests[0][1]['model'])
         self.assertEqual(.2,self.native.status()['decisions'][0]['simple_probability'])
+
+    def test_development_policy_uses_route_owned_criteria(self):
+        decision = dict(self.decision, task_policy='development_primary')
+        validated = decisions.validate(decision)
+        self.assertEqual('development_primary', validated['task_policy'])
+        route = self.native.save_route(dict(self.route, decision=validated))
+        self.native.enable(route['id'])
+        self.assertEqual(200, self.request(self.body('运行现有测试并汇总结果'))[0])
+        payload = json.loads(self.judge_calls[0][0]['input'][0]['content'][0]['text'])
+        self.assertEqual(decisions.DEVELOPMENT_CRITERIA, payload['questions']['q0']['criteria'])
+        # HiRoute maps probability 0 to regular. Do not reverse the criteria.
+        self.assertTrue(payload['questions']['q0']['criteria'][0].startswith('Testing work:'))
+        self.assertTrue(payload['questions']['q0']['criteria'][1].startswith('Software implementation'))
+        self.assertIn('测试', self.native.status()['decisions'][0]['reason'])
+        self.assertEqual(200,self.request(self.body('设计复杂测试框架'),headers={'session_id':'test-framework'})[0])
+        self.assertEqual('gpt-test-small',self.requests[-1][1]['model'])
+        self.probability=.01
+        self.assertEqual(200,self.request(self.body('review代码'),headers={'session_id':'code-review'})[0])
+        self.assertEqual('gpt-test-large',self.requests[-1][1]['model'])
+        with self.assertRaises(CollectorError):decisions.validate(dict(decision,task_policy='unknown'))
 
     def test_tool_continuations_reuse_one_judgment(self):
         body=self.body();self.request(body)

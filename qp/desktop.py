@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import time
+import sqlite3
 
 from .collectors.base import CollectorError
 
@@ -68,14 +69,16 @@ def status(native):
             pass
     if state:
         result.update(config_path=state['config_path'], backup_path=state['backup_path'])
+        builtin = state.get('transport') == 'builtin-openai'
         result['hot_switch'] = bool(state.get('hot_switch'))
         result['switch_mode'] = state.get('switch_mode')
-        result['needs_upgrade'] = not state.get('hot_switch') and (not state['provider'].get('requires_openai_auth', False) or not state.get('legacy_enabled'))
+        result['needs_upgrade'] = not state.get('hot_switch') and (not builtin or not state.get('legacy_enabled'))
         try:
             _, doc = read_config(Path(state['config_path']))
             result['connected'] = (all(doc.get(k) == v for k, v in state['managed'].items()
                                        if k != 'model_reasoning_effort') and
-                                   (state.get('hot_switch') or doc.get('model_providers', {}).get(state.get('provider_id', 'qpool')) == state['provider']))
+                                   (not doc.get('model_providers', {}).get('openai') if (builtin or state.get('hot_switch')) else
+                                    doc.get('model_providers', {}).get(state.get('provider_id', 'qpool')) == state['provider']))
             if not result['connected']:
                 result['error'] = 'Codex 配置已变化，当前未完整使用 qpool 设置'
         except (OSError, ValueError, CollectorError):
@@ -83,7 +86,65 @@ def status(native):
     return result
 
 
-def connect(native):
+def connect(native, *, install_background=True):
+    """Preserve the native provider identity required by current Codex engines."""
+    from .native import atomic
+    if not native.active or not native.grant:
+        raise CollectorError('请先启用要用于桌面的路由方案')
+    if sys.platform != 'darwin':
+        raise CollectorError('当前桌面接入仅支持 macOS')
+    path = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).expanduser() / 'config.toml'
+    original, doc = read_config(path)
+    previous = read_state(native.root)
+    if previous:
+        if previous.get('transport') != 'builtin-openai':
+            raise CollectorError('旧版桌面接入需先点击“恢复官方配置”，再重新接入；不会自动改写聊天提供方')
+        if not status(native)['connected']:
+            raise CollectorError('已有桌面接入记录且配置已变化，请先恢复原配置后重新接入')
+        if install_background:
+            install_startup(native.root, previous)
+        persist_route(native)
+        return status(native)
+    url = f'http://127.0.0.1:{native.port}/legacy/v1'
+    if doc.get('openai_base_url') not in (None, url):
+        raise CollectorError('已有其他 OpenAI 网关地址，未覆盖')
+    if doc.get('profile') or doc.get('model_provider') not in (None, 'openai'):
+        raise CollectorError('请先在 Codex 中恢复官方默认提供方，再接入；未覆盖当前配置')
+    if 'openai' in doc.get('model_providers', {}):
+        raise CollectorError('配置含保留的 openai 提供方定义，未覆盖；请先修复 Codex 配置')
+    backup = native.root / 'codex-config.before-desktop.toml'
+    managed = {'model': 'qpool-auto', 'model_provider': 'openai', 'openai_base_url': url,
+               'model_catalog_json': str(native.root / 'catalog.json'),
+               'model_reasoning_effort': doc.get('model_reasoning_effort', 'medium')}
+    atomic(backup, original)
+    for key, value in managed.items():
+        doc[key] = value
+    rendered = parser().dumps(doc)
+    from . import profiles
+    state = {'transport': 'builtin-openai', 'legacy_enabled': True, 'config_path': str(path),
+             'backup_path': str(backup), 'managed': managed, 'provider_id': 'openai', 'provider': {},
+             'python': sys.executable, 'code_root': str(Path(__file__).resolve().parent.parent),
+             'db_path': str(Path(native.db_path).resolve()), 'pool_config': str(profiles.config_path().resolve()),
+             'port': native.port, 'path_env': os.environ.get('PATH', '')}
+    atomic(native.root / 'desktop.json', state)
+    try:
+        persist_route(native)
+        if (path.read_text() if path.exists() else '') != original:
+            raise CollectorError('Codex 配置刚被其他操作修改，未覆盖；请重试')
+        atomic(path, rendered)
+        if install_background:
+            install_startup(native.root, state)
+    except Exception:
+        if path.exists() and path.read_text() == rendered:
+            atomic(path, original)
+        (native.root / 'desktop.json').unlink(missing_ok=True)
+        (native.root / 'desktop-route.json').unlink(missing_ok=True)
+        raise
+    return status(native)
+
+
+def _connect_custom_provider(native):
+    """Pre-0.166 transport retained for compatibility tests and recovery only."""
     from .native import atomic
     if not native.active or not native.grant:
         raise CollectorError('请先启用要用于桌面的路由方案')
@@ -105,11 +166,18 @@ def connect(native):
             persist_route(native)
             enable_legacy(native)
             return status(native)
-    if (not previous or previous.get('provider_id', 'qpool') != PROVIDER) and PROVIDER in doc.get('model_providers', {}):
-        raise CollectorError('Codex 已存在非本次管理的 qpool 提供方，未覆盖')
+    provider_id = PROVIDER
+    existing = doc.get('model_providers', {}).get(PROVIDER)
+    if (not previous or previous.get('provider_id', 'qpool') != PROVIDER) and existing is not None:
+        if existing == OFFICIAL_COMPATIBILITY:
+            # Restored chats must keep their official transport. A new opt-in
+            # gets a new provider ID instead of redirecting those old chats.
+            provider_id = PROVIDER + '-' + secrets.token_hex(6)
+        else:
+            raise CollectorError('Codex 已存在非本次管理的 qpool 提供方，未覆盖')
     if doc.get('profile'):
         raise CollectorError('Codex 正在使用配置 profile，暂不覆盖；请先在 Codex 中切回默认配置')
-    managed = {'model': 'qpool-auto', 'model_provider': PROVIDER,
+    managed = {'model': 'qpool-auto', 'model_provider': provider_id,
                'openai_base_url': legacy_url,
                'model_catalog_json': str(native.root / 'catalog.json'),
                'model_reasoning_effort': doc.get('model_reasoning_effort', 'medium')}
@@ -130,11 +198,11 @@ def connect(native):
         # Upgrade the original shared provider without leaving auth behind to
         # deep-merge with the CLI wrapper's independent provider configuration.
         doc.get('model_providers', {}).pop(previous.get('provider_id', 'qpool'), None)
-    doc.setdefault('model_providers', parser().table())[PROVIDER] = provider
+    doc.setdefault('model_providers', parser().table())[provider_id] = provider
     rendered = parser().dumps(doc)
     # Parse before writing; TOML editing preserves unrelated values and comments.
     parser().parse(rendered)
-    state = {'legacy_enabled': True, 'config_path': str(path), 'backup_path': str(backup), 'managed': managed, 'provider_id': PROVIDER,
+    state = {'legacy_enabled': True, 'config_path': str(path), 'backup_path': str(backup), 'managed': managed, 'provider_id': provider_id,
              'provider': provider, 'python': sys.executable, 'code_root': code_root,
              'db_path': str(Path(native.db_path).resolve()), 'pool_config': str(native.root.parent / 'pools.json'),
              'port': native.port, 'path_env': os.environ.get('PATH', '')}
@@ -189,6 +257,38 @@ def enable_legacy(native):
         raise
 
 
+def recovery_sessions(root):
+    """Find owned aliases even if selection failed before its first receipt."""
+    path = Path(root) / 'sessions.db'
+    if not path.exists():
+        raise CollectorError('会话账本缺失，保留接入配置与备份')
+    sessions = {}
+    try:
+        with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True) as conn:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {'requests', 'session_bindings', 'legacy_bindings'} <= tables:
+                raise ValueError('Incomplete session ledger')
+            sessions.update(conn.execute('SELECT session,model FROM requests ORDER BY started'))
+            bound = set()
+            for table in ('session_bindings', 'legacy_bindings'):
+                for sid, raw in conn.execute(f'SELECT session,binding FROM {table}'):
+                    if sid in bound:
+                        raise ValueError('Conflicting entry bindings')
+                    bound.add(sid)
+                    if raw is None:
+                        if sid not in sessions:
+                            raise ValueError('No model for owned session')
+                        continue
+                    # A binding may be newer than the latest request receipt.
+                    sessions[sid] = json.loads(raw)['channel']['model']
+        if any(not isinstance(model, str) or not model.strip() or model.startswith('qpool')
+               for model in sessions.values()):
+            raise ValueError('No real model for owned session')
+    except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+        raise CollectorError('无法确认已绑定聊天的恢复模型，保留接入配置与备份') from exc
+    return sessions
+
+
 def restore(native):
     from .native import atomic
     state = read_state(native.root)
@@ -205,7 +305,8 @@ def restore(native):
             raise CollectorError('Codex 的模型设置已在外部修改，未覆盖；原配置备份保留在接入状态中')
     providers = doc.get('model_providers', {})
     provider_id = state.get('provider_id', 'qpool')
-    if not state.get('hot_switch') and providers.get(provider_id) not in (None, state['provider']):
+    builtin = state.get('transport') == 'builtin-openai'
+    if ((builtin or state.get('hot_switch')) and provider_id in providers) or (not builtin and not state.get('hot_switch') and providers.get(provider_id) not in (None, state['provider'])):
         raise CollectorError('qpool 提供方已在外部修改，未覆盖；请检查原配置备份')
     for key in state['managed']:
         if key == 'model_reasoning_effort' and doc.get(key) != state['managed'].get(key):
@@ -214,7 +315,7 @@ def restore(native):
             doc[key] = before[key]
         else:
             doc.pop(key, None)
-    if not state.get('hot_switch'):
+    if not builtin and not state.get('hot_switch'):
         providers.pop(provider_id, None)
     if not providers and 'model_providers' not in before:
         doc.pop('model_providers', None)
@@ -223,7 +324,8 @@ def restore(native):
     from .codex_recovery import BINARY, recover
     recovery_report = None
     if not state.get('hot_switch'):
-        recovered = recover(path.parent, provider_id, before.get('model'), native.root, before.get('model_provider', 'openai'))
+        recovered = recover(path.parent, provider_id, before.get('model'), native.root, before.get('model_provider', 'openai'),
+                            **({'managed_sessions': recovery_sessions(native.root), 'require_owned_aliases': True} if builtin else {}))
         compatibility_ids = getattr(recovered, 'compatibility_ids', [])
         if compatibility_ids:
             # The engine pins old IDs. Restore the default provider while giving

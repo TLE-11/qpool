@@ -1,0 +1,154 @@
+{
+  "desktop_version": "26.1029.61003",
+  "bundled_engine": "0.166.0-alpha.6",
+  "config_probe": {
+    "entry": "bundled app-server, separate user home, no CLI -c overrides",
+    "stages": [
+      {
+        "stage": "new-chat-default-config",
+        "engine_status": "completed",
+        "receipts": [
+          [
+            "li…@gmail.com · plus",
+            "gpt-6.1-sol",
+            "completed"
+          ]
+        ]
+      },
+      {
+        "stage": "old-chat-native-config",
+        "engine_status": "completed",
+        "receipts": [
+          [
+            "li…@163.com · pro",
+            "gpt-6.1-sol",
+            "completed"
+          ]
+        ]
+      },
+      {
+        "stage": "old-chat-migrated-plus",
+        "engine_status": "completed",
+        "receipts": [
+          [
+            "li…@gmail.com · plus",
+            "gpt-6.1-sol",
+            "completed"
+          ]
+        ]
+      },
+      {
+        "stage": "old-chat-review-astra",
+        "engine_status": "completed",
+        "receipts": [
+          [
+            "li…@gmail.com · plus",
+            "gpt-6-astra",
+            "completed"
+          ]
+        ]
+      }
+    ],
+    "isolation": {
+      "originals_unchanged": true,
+      "gateway_receipts": [
+        {
+          "id": "52bbaae1aa0c050e0f1a092f",
+          "account": "li…@163.com · pro",
+          "model": "gpt-6.1-sol",
+          "status": "completed",
+          "started": 1793937352.768534
+        },
+        {
+          "id": "eb2f69aed4d1bf77beb8da43",
+          "account": "li…@gmail.com · plus",
+          "model": "gpt-6.1-sol",
+          "status": "completed",
+          "started": 1793937359.314393
+        },
+        {
+          "id": "f5fea8f6541c79727404d971",
+          "account": "li…@gmail.com · plus",
+          "model": "gpt-6-astra",
+          "status": "completed",
+          "started": 1793937366.975462
+        }
+      ],
+      "gateway_observed": true,
+      "full_gui_regression": "requires_desktop_browser_observation"
+    },
+    "full_gui_regression": "not_run_app_control_prohibited"
+  },
+  "builtin_restore_probe": {
+    "same_thread": true,
+    "provider": "openai",
+    "model": "gpt-6-astra",
+    "official_turn": "completed",
+    "history_recalled": true,
+    "gateway_stopped_before_restore": true,
+    "isolation": {
+      "originals_unchanged": true,
+      "gateway_receipts": [
+        {
+          "id": "52bbaae1aa0c050e0f1a092f",
+          "account": "li…@163.com · pro",
+          "model": "gpt-6.1-sol",
+          "status": "completed",
+          "started": 1793937352.768534
+        },
+        {
+          "id": "eb2f69aed4d1bf77beb8da43",
+          "account": "li…@gmail.com · plus",
+          "model": "gpt-6.1-sol",
+          "status": "completed",
+          "started": 1793937359.314393
+        },
+        {
+          "id": "f5fea8f6541c79727404d971",
+          "account": "li…@gmail.com · plus",
+          "model": "gpt-6-astra",
+          "status": "completed",
+          "started": 1793937366.975462
+        }
+      ],
+      "gateway_observed": true,
+      "full_gui_regression": "requires_desktop_browser_observation"
+    },
+    "full_gui_regression": "not_run_app_control_prohibited"
+  },
+  "isolated_ledger_counts": [
+    [
+      "completed",
+      7
+    ]
+  ],
+  "expected_selection_failures_before_fix": 3,
+  "cleanup": {
+    "production_and_isolated_ports_closed": [
+      8765,
+      57473,
+      58936
+    ],
+    "production_desktop_state": false,
+    "qpool_launchagents": 0,
+    "temporary_login_copies_removed": true,
+    "main_config_sha256": "cb18547233ce07a78de5458d06a4bfd386089bb6a0c3692de25727af3df7bcf0"
+  },
+  "source_sha256": {
+    "qp/native.py": "77a9f1814d8acc30e25a91d84d1cf06b68c6263eb09a0c6f2681f01b48b53009",
+    "qp/desktop.py": "0fae8db09c01316f3670dcfe337ac94dd9cc030aa34eb309280bdfb952a44450",
+    "qp/codex_recovery.py": "cf505e617671b6e302a4bf6532e70f055e52e0becdfb5b96845b7d4a76b3e458",
+    "scripts/isolated_qa_runtime.py": "171b6ed0a95a04aea8dbaaff001dfbee6c04981a64534e936540cae6cc16fca5",
+    "scripts/isolated_desktop_qa.py": "99959baec9c54edb364f35ba079deb7f542c6220e3841c70240a1065f0bca579",
+    "scripts/isolated_desktop_config_probe.py": "4c3cdd77e06e4eb0b33259a7c60fc46509c5d4561f5112dc4b21f73e2e99be2e",
+    "scripts/isolated_builtin_restore_probe.py": "ce7abea14a5dace59a32540c1482e93aae71c3bc3547fcc77cbbc267f0124e81"
+  },
+  "final_validation": {
+    "unittest_passed": 209,
+    "duration_seconds": 104.551,
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "diff_check": "passed",
+    "independent_review": "read-only; no new blocker in reviewed scope; GUI remains unverified"
+  }
+}

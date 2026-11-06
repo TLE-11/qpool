@@ -129,6 +129,13 @@ def _next_reset_start(entry: Any, now: datetime) -> Optional[datetime]:
 
 def apply_due_resets(db: Database) -> int:
     """Lazily reset subscription quotas whose billing period has passed."""
+    with db.conn:
+        db.conn.execute("BEGIN IMMEDIATE")
+        return _apply_due_resets(db)
+
+
+def _apply_due_resets(db: Database) -> int:
+    """Caller holds the write transaction, including any subsequent debit."""
     now = now_utc()
     rows = db.conn.execute(
         "SELECT * FROM quota_entries WHERE kind = 'subscription' "
@@ -154,8 +161,6 @@ def apply_due_resets(db: Database) -> int:
                 (iso(new_start), iso(now), row["id"]),
             )
         reset += 1
-    if reset:
-        db.conn.commit()
     return reset
 
 
@@ -300,31 +305,32 @@ def consume(
 ) -> Dict[str, Any]:
     if not math.isfinite(amount) or amount <= 0:
         raise LedgerError("amount must be > 0")
-    apply_due_resets(db)
-    row = db.conn.execute("SELECT * FROM quota_entries WHERE id = ?", (entry_id,)).fetchone()
-    if row is None:
-        raise LedgerError(f"quota entry #{entry_id} not found")
-    if row["source_kind"] == "snapshot" or row["last_synced_at"]:
-        raise LedgerError("vendor snapshots are read-only; record request usage separately")
-    now = now_utc()
-    remaining = row["remaining"]
-    if not force:
-        # manual bookkeeping path: strict state checks (omx-style)
-        status = entry_status(row, now)
-        if status == STATUS_EXPIRED:
-            raise LedgerError(f"entry #{entry_id} expired at {row['expires_at']}; cannot consume")
-        if status == STATUS_DEPLETED:
-            raise LedgerError(f"entry #{entry_id} is depleted")
-        if remaining is not None and amount > remaining:
-            raise LedgerError(
-                f"insufficient quota on entry #{entry_id}: "
-                f"{_plain(remaining)} {row['unit']} left, requested {_plain(amount)}"
-            )
-    # force=True (fact-backfill from the passthrough gateway): the consumption
-    # already happened upstream, so we record it even past zero -- a negative
-    # remaining is a truthful "overdrawn" signal.
-    est_cost = amount * row["cost_per_unit"]
-    with db.conn:  # single transaction: decrement + append event
+    with db.conn:  # Lock before reading: validation, decrement and event are atomic.
+        db.conn.execute("BEGIN IMMEDIATE")
+        _apply_due_resets(db)
+        row = db.conn.execute("SELECT * FROM quota_entries WHERE id = ?", (entry_id,)).fetchone()
+        if row is None:
+            raise LedgerError(f"quota entry #{entry_id} not found")
+        if row["source_kind"] == "snapshot" or row["last_synced_at"]:
+            raise LedgerError("vendor snapshots are read-only; record request usage separately")
+        now = now_utc()
+        remaining = row["remaining"]
+        if not force:
+            # manual bookkeeping path: strict state checks (omx-style)
+            status = entry_status(row, now)
+            if status == STATUS_EXPIRED:
+                raise LedgerError(f"entry #{entry_id} expired at {row['expires_at']}; cannot consume")
+            if status == STATUS_DEPLETED:
+                raise LedgerError(f"entry #{entry_id} is depleted")
+            if remaining is not None and amount > remaining:
+                raise LedgerError(
+                    f"insufficient quota on entry #{entry_id}: "
+                    f"{_plain(remaining)} {row['unit']} left, requested {_plain(amount)}"
+                )
+        # force=True (fact-backfill from the passthrough gateway): the consumption
+        # already happened upstream, so we record it even past zero -- a negative
+        # remaining is a truthful "overdrawn" signal.
+        est_cost = amount * row["cost_per_unit"]
         if remaining is not None:
             db.conn.execute(
                 "UPDATE quota_entries SET remaining = remaining - ?, updated_at = ? WHERE id = ?",

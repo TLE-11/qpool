@@ -362,6 +362,41 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(200, self.request(self.body())[0])
         self.assertEqual('gpt-test-small', self.requests[-1][1]['model'])
 
+    def test_apply_active_route_keeps_grant_and_current_turn_then_uses_new_rule(self):
+        self.assertEqual(200,self.request(self.body())[0])
+        grant=self.native.grant
+        with self.native.receipts() as conn:
+            before=conn.execute('SELECT binding FROM session_bindings').fetchone()[0]
+        updated=dict(self.route, mode='fixed', regular=[], apply_to_active=True)
+        self.native.save_route(updated)
+        self.assertEqual(grant,self.native.grant)
+        with self.native.receipts() as conn:
+            self.assertEqual(before,conn.execute('SELECT binding FROM session_bindings').fetchone()[0])
+        self.native.bindings.clear()
+        body=self.body()
+        body['input'].append({'type':'function_call_output','call_id':'c1','output':'ok'})
+        self.assertEqual(200,self.request(body)[0])
+        self.assertEqual('gpt-test-small',self.requests[-1][1]['model'])
+        body['input'].append({'role':'user','content':'next task'})
+        self.assertEqual(200,self.request(body)[0])
+        self.assertEqual('gpt-test-large',self.requests[-1][1]['model'])
+
+    def test_apply_active_route_refuses_inflight_and_rolls_back_persist_failure(self):
+        self.assertEqual(200,self.request(self.body())[0])
+        route=dict(self.route,mode='fixed',regular=[],apply_to_active=True)
+        before=self.native.path.read_text()
+        with self.native.turn_lock(('request','some-session')):
+            with self.assertRaisesRegex(CollectorError,'请求运行'):
+                self.native.save_route(route)
+        with self.native.receipts() as conn:
+            saved=tuple(conn.execute('SELECT * FROM session_bindings').fetchone())
+        with patch('qp.desktop.persist_route',side_effect=OSError('simulated')):
+            with self.assertRaises(OSError):self.native.save_route(route)
+        self.assertEqual(before,self.native.path.read_text())
+        self.assertEqual(self.route,self.native.active)
+        with self.native.receipts() as conn:
+            self.assertEqual(saved,tuple(conn.execute('SELECT * FROM session_bindings').fetchone()))
+
     def test_disable_reenable_restores_binding_without_rebinding_account(self):
         self.assertEqual(200, self.request(self.body())[0])
         old_grant = self.native.grant
@@ -377,7 +412,9 @@ class NativeTests(unittest.TestCase):
     def test_status_explains_native_account_pin_separately_from_model_decision(self):
         from qp import desktop
         desktop.connect(self.native)
-        self.assertEqual(200, self.request(self.body(), token='synthetic-access-secret', path='/legacy/v1/responses')[0])
+        body = self.body()
+        body['input'].insert(0, {'type': 'reasoning', 'encrypted_content': 'synthetic-old-history'})
+        self.assertEqual(200, self.request(body, token='synthetic-access-secret', path='/legacy/v1/responses')[0])
         row = self.native.status()['sessions'][0]
         self.assertIn('原生聊天', row['account_policy'])
         self.assertIn('不参与 Plus 优先', row['account_policy'])

@@ -1,0 +1,122 @@
+{
+  "production_endpoints": true,
+  "stages": [
+    {
+      "stage": "upgraded-native",
+      "mode": "native",
+      "thread_id": "01a1af76-9651-74c0-bae4-b19f41be8ea9",
+      "engine_pid": 78662,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ],
+      "passed": true
+    },
+    {
+      "stage": "upgraded-next-turn-qpool",
+      "mode": "qpool",
+      "thread_id": "01a1af76-9651-74c0-bae4-b19f41be8ea9",
+      "engine_pid": 78662,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": null
+        }
+      ],
+      "passed": true
+    },
+    {
+      "stage": "upgraded-next-turn-native",
+      "mode": "native",
+      "thread_id": "01a1af76-9651-74c0-bae4-b19f41be8ea9",
+      "engine_pid": 78662,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ],
+      "passed": true
+    }
+  ],
+  "cross_account": false,
+  "legacy_creation": {
+    "thread_id": "01a1af76-9651-74c0-bae4-b19f41be8ea9",
+    "engine_pid": 78201,
+    "history_recalled": true,
+    "item_types": [
+      "userMessage",
+      "agentMessage",
+      "commandExecution",
+      "agentMessage"
+    ],
+    "legacy_binding_verified": true,
+    "receipts": [
+      {
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "actual_model": "gpt-6.1-sol",
+        "entry_mode": null
+      },
+      {
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "actual_model": "gpt-6.1-sol",
+        "entry_mode": null
+      }
+    ]
+  },
+  "upgrade": {
+    "initial_reload": true,
+    "resumed_same_thread": true,
+    "engine_pid_after_upgrade": 78662
+  },
+  "config_unchanged_during_switches": true,
+  "original_files_unchanged": true,
+  "date": "2026-11-06",
+  "engine": "codex-cli 0.167.0-alpha.3.2",
+  "merge_sources": [
+    "89e81f7",
+    "f34ac60"
+  ],
+  "test_kind": "Merged production code; isolated real subscription model and app-server; no desktop UI automation",
+  "limitations": [
+    "One initial reload during endpoint upgrade; no restart between subsequent native/qpool/native questions.",
+    "Old native account retained; not a cross-account migration."
+  ],
+  "regression": {
+    "full_suite_passed": 244,
+    "full_suite_failed": 0,
+    "seconds": 129.391,
+    "independent_merge_review": "passed; protocol-turn migration boundary fixed and covered"
+  }
+}

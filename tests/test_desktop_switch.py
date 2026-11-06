@@ -253,7 +253,7 @@ class HotSwitchTests(unittest.TestCase):
 
     def upgrade_legacy_chat(self):
         desktop.restore(self.native)
-        desktop.connect(self.native)
+        desktop._connect_custom_provider(self.native)
         body = self.body()
         body['input'].insert(0, {'type': 'reasoning', 'encrypted_content': 'synthetic-old-history'})
         self.assertEqual(200, self.request(body, path='/legacy/v1/responses')[0])

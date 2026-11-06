@@ -1,7 +1,8 @@
 """Small explicit live-QA helpers; prints only selected status fields."""
-import http.client,json,os,queue,subprocess,threading,time,re
+import argparse,http.client,json,os,queue,subprocess,threading,time,re
 from pathlib import Path
 
+ROOT=Path(__file__).resolve().parents[1]
 BINARY='/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 
 
@@ -78,3 +79,37 @@ class Client:
         try:self.p.wait(timeout=8)
         except subprocess.TimeoutExpired:self.p.kill();self.p.wait()
         for h in (self.p.stdin,self.p.stdout,self.p.stderr):h.close()
+
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('action',choices=['sync','judge','proxy-inspect'])
+    args=p.parse_args()
+    if args.action=='sync':
+        result=api(args.root,'/api/sync',{});print(json.dumps(result,ensure_ascii=False),flush=True)
+        state=api(args.root,'/api/state')
+        print('subscription_windows',json.dumps([{'account':p['account_id'],'windows':p['windows']} for p in state['pools'] if p['kind']=='subscription'],ensure_ascii=False),flush=True)
+    elif args.action=='judge':
+        decision=api(args.root,'/api/state')['native']['active']['decision']
+        cases=[('test-run','运行已有测试，整理通过和失败结果，不改业务代码。','regular'),
+               ('test-framework','设计并发故障注入测试框架及覆盖策略，本次仅做测试框架设计。','regular'),
+               ('failure-analysis','分析复杂分布式测试失败，定位并发一致性根因，仅分析不实现修复。','regular'),
+               ('code-review','Review本次代码变更，检查安全、竞态与兼容性，只做代码审查。','primary'),
+               ('implementation','实现幂等扣减额度接口，并修复并发重复扣减代码。','primary'),
+               ('proposal','为多租户网关出架构技术方案，比较一致性与故障恢复设计。','primary')]
+        results=[]
+        for label,task,expected in cases:
+            r=api(args.root,'/api/decision/model-test',{'decision':decision,'task':task,'allow_api':False})
+            row=dict(case=label,expected=expected,**{k:r.get(k) for k in ['group','fallback','source','model','actual_model','reason','input_tokens','output_tokens']})
+            row['passed']=r['group']==expected and not r.get('fallback')
+            results.append(row);print(json.dumps(row,ensure_ascii=False),flush=True)
+        (args.root/'judge-results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2))
+        if not all(r['passed'] for r in results):raise SystemExit('real classification acceptance failed')
+    else:
+        c=Client(proxy=True)
+        try:
+            result=c.call('thread/loaded/list',{})
+            print('desktop_proxy',result)
+        finally:c.close()
+
+
+if __name__=='__main__':main()

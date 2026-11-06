@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+import hashlib
 
 from .collectors.base import CollectorError
 
@@ -17,14 +18,19 @@ class RecoveryResult(list):
     """Restored thread IDs, including IDs that require a compatibility provider."""
     def __init__(self, ids=(), compatibility_ids=()):
         super().__init__(ids)
-        self.compatibility_ids = list(compatibility_ids)
+        self.compatibility_ids = list(ids) if compatibility_ids is True else list(compatibility_ids or ())
+        self.compatibility_provider = bool(self.compatibility_ids)
 
 
 class ProviderMismatch(CollectorError):
     pass
 
 
-def recover(home, provider, model, backup_root, original_provider='openai'):
+def recover(home, provider, model, backup_root, original_provider='openai', *, managed_sessions=None,
+            require_owned_aliases=False):
+    """Optionally restore only known receipt sessions still using a qpool alias."""
+    if managed_sessions is not None and not managed_sessions and not require_owned_aliases:
+        return []
     home = Path(home)
     if not list(home.glob('state_*.sqlite')):
         return []
@@ -70,7 +76,15 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
                         'sourceKinds': ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
                                         'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'],
                         'archived': archived, 'cursor': cursor, 'limit': 100, 'useStateDbOnly': True})
-                    records.extend(dict(row, _qpool_archived=archived) for row in page['data'])
+                    for row in page['data']:
+                        if managed_sessions is not None:
+                            sid = hashlib.sha256(row['id'].encode()).hexdigest()[:16]
+                            if (require_owned_aliases and sid not in managed_sessions
+                                    and (row.get('model') or '').startswith('qpool')):
+                                raise CollectorError('存在无法确认恢复模型的 qpool 聊天，保留接入配置与备份；请先为该聊天选择真实模型')
+                            if sid not in managed_sessions or not (row.get('model') or '').startswith('qpool'):
+                                continue
+                        records.append(dict(row, _qpool_archived=archived))
                     cursor = page.get('nextCursor')
                     if not cursor:
                         break
@@ -78,7 +92,7 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
         records = list_managed()
         if not records:
             return []
-        if not model or model.startswith('qpool'):
+        if managed_sessions is None and (not model or model.startswith('qpool')):
             raise CollectorError('原配置未提供可恢复的官方模型，保留接入配置')
         if original_provider != 'openai':
             raise CollectorError('原提供方不是官方 OpenAI，保留配置以便人工恢复聊天')
@@ -96,7 +110,13 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
         compatibility_ids = []
         for row in records:
             previous_model = row.get('model')
-            target_model = previous_model if previous_model and not previous_model.startswith('qpool') else model
+            if managed_sessions is not None:
+                sid = hashlib.sha256(row['id'].encode()).hexdigest()[:16]
+                target_model = managed_sessions[sid]
+                if not isinstance(target_model, str) or not target_model or target_model.startswith('qpool'):
+                    raise CollectorError('已知聊天缺少可恢复的真实模型，保留接入配置')
+            else:
+                target_model = previous_model if previous_model and not previous_model.startswith('qpool') else model
             unarchived = False
             try:
                 if row['_qpool_archived']:
