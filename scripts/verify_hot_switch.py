@@ -27,6 +27,8 @@ def main():
     parser.add_argument('--source-root', type=Path, required=True,
                         help='Existing repository containing .qpool/console/pools.json')
     parser.add_argument('--observe-transport', action='store_true', help='Log safe response protocol metadata only.')
+    parser.add_argument('--legacy-upgrade', action='store_true',
+                        help='Create an old OpenAI chat through /legacy, upgrade, then switch without reloads.')
     args = parser.parse_args()
     from qp.native import atomic
     from qp import web, desktop_switch
@@ -100,7 +102,7 @@ def main():
             account['source']['credentials_file'] = str(account_home / 'auth.json')
             account['source']['profile_dir'] = str(account_home)
         native_id = next(a['id'] for a in config['accounts'] if a['source']['expected_subject'] == subject)
-        target_id = next(a['id'] for a in config['accounts'] if a['id'] != native_id)
+        target_id = native_id if args.legacy_upgrade else next(a['id'] for a in config['accounts'] if a['id'] != native_id)
         target_label = next(a.get('label', a['id']) for a in config['accounts'] if a['id'] == target_id)
         ids = {a['id'] for a in config['accounts']}
         config['channels'] = [c for c in config['channels'] if c['account_id'] in ids]
@@ -115,10 +117,9 @@ def main():
             'allow_api': False, 'primary': [target_id + '-gpt-6.1-sol'], 'regular': []})
         console.native.enable(route['id'])
         with patch('qp.desktop.install_startup'):
-            api(root, '/api/desktop/hot-connect', {})
-        config_hash = hashlib.sha256((home / 'config.toml').read_bytes()).hexdigest()
-        report.update(cross_account=True, native_account=native_id, pool_account=target_id)
-        print(json.dumps({'root': str(root), 'cross_account': True}), flush=True)
+            api(root, '/api/desktop/connect' if args.legacy_upgrade else '/api/desktop/hot-connect', {})
+        report.update(cross_account=not args.legacy_upgrade, native_account=native_id, pool_account=target_id)
+        print(json.dumps({'root': str(root), 'cross_account': report['cross_account']}), flush=True)
 
         def receipts(tid):
             sid = hashlib.sha256(tid.encode()).hexdigest()[:16]
@@ -129,6 +130,42 @@ def main():
                 if all(r['status'] != 'running' for r in rows) or time.monotonic() > until:
                     return rows
                 time.sleep(.01)
+
+        if args.legacy_upgrade:
+            client = clients['legacy'] = Client(home=home, overrides={'model_provider': 'openai', 'model': 'gpt-6.1-sol'})
+            start = client.call('thread/start', {'cwd': str(workspace), 'approvalPolicy': 'never',
+                'sandbox': 'read-only', 'ephemeral': False, 'modelProvider': 'openai', 'model': 'gpt-6.1-sol'})
+            assert start['modelProvider'] == 'openai'
+            tid = threads['legacy'] = start['thread']['id']
+            markers['legacy'] = 'HOT_SWITCH_' + secrets.token_hex(12)
+            marker_file = workspace / 'legacy.txt'
+            marker_file.write_text(markers['legacy'])
+            response = client.turn(tid, 'Use a tool to read ' + str(marker_file) +
+                '. Remember its content and reply with that content only. Do not modify any files.')
+            rows = receipts(tid)
+            assert markers['legacy'] in response['text'] and 'commandExecution' in response['item_types']
+            assert rows and all(r['status'] == 'completed' for r in rows)
+            with console.native.receipts() as db:
+                saved = db.execute('SELECT account FROM legacy_bindings WHERE session=?',
+                    (hashlib.sha256(tid.encode()).hexdigest()[:16],)).fetchone()
+                assert saved and saved['account'] == native_id
+            report['legacy_creation'] = {'thread_id': tid, 'engine_pid': client.p.pid,
+                'history_recalled': True, 'item_types': response['item_types'],
+                'legacy_binding_verified': True, 'receipts': rows}
+            client.close()
+            del clients['legacy']
+            # Initial endpoint installation needs one reload. All three turns
+            # below share the resumed engine; switching itself never reloads it.
+            with patch('qp.desktop.remove_startup'), patch('qp.desktop.install_startup'):
+                api(root, '/api/desktop/restore', {})
+                api(root, '/api/desktop/hot-connect', {})
+            client = clients['legacy'] = Client(home=home)
+            resumed = client.call('thread/resume', {'threadId': tid, 'excludeTurns': True})
+            assert resumed['thread']['id'] == tid and resumed['modelProvider'] == 'openai'
+            pids['legacy'] = client.p.pid
+            report['upgrade'] = {'initial_reload': True, 'resumed_same_thread': True,
+                                 'engine_pid_after_upgrade': client.p.pid}
+        config_hash = hashlib.sha256((home / 'config.toml').read_bytes()).hexdigest()
 
         def turn(key, mode, label):
             result = api(root, '/api/desktop/mode', {'mode': mode})
@@ -169,15 +206,12 @@ def main():
             print(json.dumps(row, ensure_ascii=False), flush=True)
             assert row['passed'], 'production hot-switch verification failed'
 
-        turn('native', 'native', 'native-created-with-tool')
-        turn('native', 'qpool', 'native-to-qpool')
-        turn('native', 'native', 'native-qpool-native')
-        turn('pool', 'qpool', 'qpool-created-with-tool')
-        turn('pool', 'native', 'qpool-to-native')
-        turn('pool', 'qpool', 'qpool-native-qpool')
-        turn('native', 'qpool', 'native-second-qpool')
-        turn('native', 'native', 'native-second-native')
-        turn('pool', 'native', 'qpool-second-native')
+        if args.legacy_upgrade:
+            turn('legacy', 'native', 'upgraded-native')
+            turn('legacy', 'qpool', 'upgraded-next-turn-qpool')
+            turn('legacy', 'native', 'upgraded-next-turn-native')
+        else:
+            run_round_trips(turn)
         report['config_unchanged_during_switches'] = hashlib.sha256((home / 'config.toml').read_bytes()).hexdigest() == config_hash
     finally:
         for client in clients.values():
@@ -196,8 +230,20 @@ def main():
         atomic(root / 'report.json', report)
         print(json.dumps({'report': str(root / 'report.json'),
                           'original_files_unchanged': report['original_files_unchanged']}), flush=True)
-    assert len(report['stages']) == 9 and all(r['passed'] for r in report['stages'])
+    assert len(report['stages']) == (3 if args.legacy_upgrade else 9) and all(r['passed'] for r in report['stages'])
     assert report['original_files_unchanged'] and report['config_unchanged_during_switches']
+
+
+def run_round_trips(turn):
+    turn('native', 'native', 'native-created-with-tool')
+    turn('native', 'qpool', 'native-to-qpool')
+    turn('native', 'native', 'native-qpool-native')
+    turn('pool', 'qpool', 'qpool-created-with-tool')
+    turn('pool', 'native', 'qpool-to-native')
+    turn('pool', 'qpool', 'qpool-native-qpool')
+    turn('native', 'qpool', 'native-second-qpool')
+    turn('native', 'native', 'native-second-native')
+    turn('pool', 'native', 'qpool-second-native')
 
 
 if __name__ == '__main__':
