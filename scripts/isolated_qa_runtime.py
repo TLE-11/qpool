@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import signal
 import sys
+import threading
+import time
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
@@ -39,6 +41,8 @@ def main():
     parser.add_argument('--live', action='store_true', required=True)
     parser.add_argument('--trace-shapes', action='store_true',
                         help='Print only synthetic request model/type/role metadata, never message text')
+    parser.add_argument('--fault-before-receipt', action='store_true',
+                        help='QA only: honor a private session-specific adapter failure marker')
     args = parser.parse_args()
     root = args.root.resolve()
     if not root.is_relative_to(REPO / '.qpool'):
@@ -70,7 +74,37 @@ def main():
             return select(body, headers, *positional, **kwargs)
         native.select = traced
     previous = json.loads((root/'runtime.json').read_text()) if (root/'runtime.json').exists() else {}
+    handler = web.Handler
+    if args.fault_before_receipt:
+        from qp.collectors.base import CollectorError
+        context = threading.local()
+        adapter = native.adapter
+        def faulting_adapter(account, **kwargs):
+            sid = getattr(context, 'session', None)
+            marker = root / 'fault-before-receipt.json'
+            if sid and marker.exists() and json.loads(marker.read_text()).get('session') == sid:
+                with native.receipts() as conn:
+                    bound = conn.execute('SELECT 1 FROM legacy_bindings WHERE session=? AND binding IS NOT NULL', (sid,)).fetchone()
+                    receipt = conn.execute('SELECT 1 FROM requests WHERE session=?', (sid,)).fetchone()
+                if bound and not receipt:
+                    events = root / 'fault-events.json'
+                    rows = json.loads(events.read_text()) if events.exists() else []
+                    rows.append({'session': sid, 'at': time.time(), 'stage': 'after-binding-before-receipt'})
+                    atomic(events, rows)
+                    raise CollectorError('QA injected adapter failure before first receipt')
+            return adapter(account, **kwargs)
+        native.adapter = faulting_adapter
+        class FailureHandler(web.Handler):
+            def do_POST(self):
+                raw = self.headers.get('session_id') or self.headers.get('thread-id') or self.headers.get('x-codex-session-id')
+                context.session = hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else None
+                try:
+                    return super().do_POST()
+                finally:
+                    context.session = None
+        handler = FailureHandler
     server = web.Server(('127.0.0.1', previous.get('port',0)),console)
+    server.RequestHandlerClass = handler
     port = server.server_port
     if not native.active:
         routes = native.data()['routes']
