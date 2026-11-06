@@ -12,17 +12,21 @@ from . import profiles, openai_account, desktop
 from .collectors.base import CollectorError
 
 
-def handle(handler, path):
+def handle(handler, path, *, switch_body=None, switch_model=None, switch_turn=None, switch_compact=False):
     native = handler.server.console.native
     authorization = handler.headers.get('Authorization', '')
     grant = native.grant
+    switch_identity = None
+    if switch_body is not None:
+        from .desktop_switch import identity
+        switch_identity = identity(native, handler.headers)
     legacy = path.startswith('/legacy/v1/')
     legacy_account = desktop.legacy_account(native, handler.headers) if legacy and handler.allowed(False) else None
     if legacy:
         path = path.removeprefix('/legacy')
     if (not handler.allowed(False) or not native.grant or
             not (bool(legacy_account) if legacy else
-                 (hmac.compare_digest(authorization.encode(), ('Bearer ' + native.grant).encode()) or
+                 (switch_identity or hmac.compare_digest(authorization.encode(), ('Bearer ' + native.grant).encode()) or
                   desktop.authorized(native, handler.headers)))):
         handler.respond(401, {'error': {'message': 'qpool 入口未授权或已停用', 'type': 'authentication_error'}})
         return
@@ -42,22 +46,25 @@ def handle(handler, path):
     usage = {}
     actual_model = None
     try:
-        size = int(handler.headers.get('Content-Length', '0'))
-        if not 0 < size <= 8 * 1024 * 1024 or handler.headers.get('Transfer-Encoding'):
-            raise CollectorError('请求过大或缺少有效 Content-Length')
-        raw = handler.rfile.read(size)
-        encoding = handler.headers.get('Content-Encoding', 'identity').lower()
-        if encoding == 'zstd':
-            try:
-                with zstandard.ZstdDecompressor(max_window_size=8 * 1024 * 1024).stream_reader(io.BytesIO(raw)) as reader:
-                    raw = reader.read(8 * 1024 * 1024 + 1)
-                if len(raw) > 8 * 1024 * 1024:
-                    raise CollectorError('解压后的请求超过大小限制')
-            except zstandard.ZstdError as exc:
-                raise CollectorError('请求压缩数据无效：' + str(exc)) from None
-        elif encoding != 'identity':
-            raise CollectorError('请求使用了不支持的压缩格式')
-        body = json.loads(raw)
+        if switch_body is None:
+            size = int(handler.headers.get('Content-Length', '0'))
+            if not 0 < size <= 8 * 1024 * 1024 or handler.headers.get('Transfer-Encoding'):
+                raise CollectorError('请求过大或缺少有效 Content-Length')
+            raw = handler.rfile.read(size)
+            encoding = handler.headers.get('Content-Encoding', 'identity').lower()
+            if encoding == 'zstd':
+                try:
+                    with zstandard.ZstdDecompressor(max_window_size=8 * 1024 * 1024).stream_reader(io.BytesIO(raw)) as reader:
+                        raw = reader.read(8 * 1024 * 1024 + 1)
+                    if len(raw) > 8 * 1024 * 1024:
+                        raise CollectorError('解压后的请求超过大小限制')
+                except zstandard.ZstdError as exc:
+                    raise CollectorError('请求压缩数据无效：' + str(exc)) from None
+            elif encoding != 'identity':
+                raise CollectorError('请求使用了不支持的压缩格式')
+            body = json.loads(raw)
+        else:
+            body = switch_body
         if not isinstance(body, dict):
             raise CollectorError('请求必须是对象')
         approval = body.get('model') == 'codex-auto-review' and not path.endswith('/compact')
@@ -68,8 +75,14 @@ def handle(handler, path):
         if approval:
             binding, session = native.approval_binding(body, handler.headers, approval_account)
         else:
-            binding, session = native.select(body, handler.headers, path.endswith('/compact'), **({'legacy_account': legacy_account} if legacy else {}))
+            selection = {'legacy_account': legacy_account} if legacy else {}
+            if switch_body is not None:
+                selection['protocol_turn'] = switch_turn
+            binding, session = native.select(body, handler.headers, path.endswith('/compact') or switch_compact, **selection)
         channel = binding['channel']
+        if switch_body is not None:
+            from .desktop_switch import validate_target
+            validate_target(native, body, switch_model, channel['model'])
         account = profiles.load()['accounts'].get(channel['account_id'])
         if not account:
             raise CollectorError('路由绑定的账号已移除，请新建会话')
@@ -80,6 +93,7 @@ def handle(handler, path):
         adapter_lock.acquire()
         adapter.ensure()
         if not native.grant or native.grant != grant or not ((desktop.legacy_account(native, handler.headers) == legacy_account) if legacy else (
+                (switch_identity and identity(native, handler.headers) == switch_identity) or
                 hmac.compare_digest(authorization.encode(), ('Bearer ' + native.grant).encode()) or
                 desktop.authorized(native, handler.headers))):
             raise CollectorError('入口已停用或更新，请重新打开 Codex')

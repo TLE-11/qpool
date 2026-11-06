@@ -231,6 +231,11 @@ class Native:
                output_tokens INTEGER, error TEXT, actual_model TEXT)''')
             if 'decision_id' not in {r['name'] for r in conn.execute('PRAGMA table_info(requests)')}:
                 conn.execute('ALTER TABLE requests ADD COLUMN decision_id TEXT')
+            if 'entry_mode' not in {r['name'] for r in conn.execute('PRAGMA table_info(requests)')}:
+                conn.execute('ALTER TABLE requests ADD COLUMN entry_mode TEXT')
+            conn.execute('''CREATE TABLE IF NOT EXISTS desktop_turns
+                (session TEXT PRIMARY KEY, turn TEXT NOT NULL, mode TEXT NOT NULL,
+                 model TEXT NOT NULL, subject TEXT NOT NULL)''')
             conn.execute('''CREATE TABLE IF NOT EXISTS decisions
                 (id TEXT PRIMARY KEY, created REAL, route TEXT, session TEXT, scope TEXT, detail TEXT)''')
             conn.execute('CREATE INDEX IF NOT EXISTS requests_session ON requests(session)')
@@ -701,7 +706,7 @@ class Native:
                 if slot[1] == 0:
                     self.turn_locks.pop(key, None)
 
-    def select(self, body, headers, compact=False, legacy_account=None):
+    def select(self, body, headers, compact=False, legacy_account=None, protocol_turn=None):
         """Pin tool continuations; never silently replay a request on another model."""
         route = self.active
         if not route:
@@ -719,17 +724,21 @@ class Native:
             raise CollectorError("需要原生 Codex 的消息列表")
         users = [i for i in items if isinstance(i, dict) and i.get('role') == 'user']
         text = ''
+        content = []
         if users:
             content = users[-1].get('content', '')
             text = content if isinstance(content, str) else '\n'.join(c.get('text', '') for c in content
                       if isinstance(c, dict) and c.get('type') in ('input_text', 'text'))
+        has_task = bool(text.strip()) or (isinstance(content, list) and any(
+            isinstance(c, dict) and c.get('type') == 'input_image' and
+            (c.get('image_url') or c.get('file_id')) for c in content))
         key = (self.grant, route['id'], sid)
-        turn = digest(str(len(users)) + ':' + text)
+        turn = protocol_turn or digest(str(len(users)) + ':' + (text if text else json.dumps(content, sort_keys=True)))
         # Desktop may append tool catalogs or runtime instructions after tool
         # output; those metadata messages do not start a new user turn.
         tail = next((i for i in reversed(items) if isinstance(i, dict)
                      and i.get('role') not in ('developer', 'system')), None)
-        continuation = compact or bool(tail and
+        continuation = compact or bool(not protocol_turn and tail and
             (tail.get('type') in ('function_call_output', 'custom_tool_call_output',
                                  'computer_call_output', 'tool_search_output') or tail.get('role') == 'tool'))
         with self.turn_lock(key):
@@ -767,11 +776,11 @@ class Native:
                             binding = None
                             verified_legacy = True
                     else:
-                        if conn.execute('SELECT 1 FROM requests WHERE session=? LIMIT 1', (sid,)).fetchone():
+                        if conn.execute("SELECT 1 FROM requests WHERE session=? AND COALESCE(entry_mode,'qpool')!='native' LIMIT 1", (sid,)).fetchone():
                             raise CollectorError('此聊天已有其他入口的执行记录，不能自动重新绑定')
             if not binding:
                 with self.receipts() as conn:
-                    seen = conn.execute('SELECT 1 FROM requests WHERE session=? LIMIT 1', (sid,)).fetchone()
+                    seen = conn.execute("SELECT 1 FROM requests WHERE session=? AND COALESCE(entry_mode,'qpool')!='native' LIMIT 1", (sid,)).fetchone()
                 if seen and not verified_legacy:
                     raise CollectorError('此会话的路由绑定已失效，请新建会话；不会跨账号迁移已有上下文')
             if binding and (continuation or binding['turn'] == turn) and (not manual or requested == binding['channel']['model']):
@@ -782,10 +791,10 @@ class Native:
             # A resumed native chat may end with historical browser/tool results.
             # Only an authenticated native account and an explicit real model can
             # seed this first binding; an automatic alias cannot infer that model.
-            native_resume = legacy_account and manual and not binding and bool(text)
+            native_resume = legacy_account and manual and not binding and has_task
             native_model_change = (legacy_account and manual and binding and not compact
                                    and len(users) > binding.get('user_count', len(users)))
-            if (continuation and not native_resume and not native_model_change) or not text:
+            if (continuation and not native_resume and not native_model_change) or not has_task:
                 raise CollectorError("未找到此轮会话的路由绑定，请新建会话后重试")
             judgment = None
             if manual:
@@ -796,8 +805,11 @@ class Native:
                 judgment = self.record_decision(self.decision_engine.run(route['decision'], text, items), route['name'], sid)
                 group, why = judgment['group'], judgment['reason']
             elif route['mode'] == 'decider':
-                decision = routing.decide(text, profiles.load()['routing'])
-                group, why = decision['group'], decision['reason']
+                if text.strip():
+                    decision = routing.decide(text, profiles.load()['routing'])
+                    group, why = decision['group'], decision['reason']
+                else:
+                    group, why = 'primary', '当前任务没有可评分文字，使用主力组'
             else:
                 # Conservative local fallback, explicitly not an LLM classifier.
                 simple = len(text) <= 800 and bool(re.search(r'翻译|translate|总结|摘要|summari[sz]e|润色|改写|拼写|格式化|你好|hello|只回复|reply.*only', text, re.I))

@@ -175,6 +175,49 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(CollectorError):desktop.restore(self.native)
         self.assertEqual('changed-by-user',tomlkit.parse(self.path.read_text())['model'])
 
+    def test_legacy_recovery_preserves_profiles_and_publishes_explicit_resume(self):
+        from qp.codex_recovery import RecoveryResult
+        name = 'personal-profile'
+        self.path.write_text(self.original + '\n[profiles.' + name + ']\nmodel="personal"\n')
+        desktop.connect(self.native)
+        with patch('qp.codex_recovery.recover', return_value=RecoveryResult(['old-id'], ['old-id'])):
+            result = desktop.restore(self.native)
+        doc = tomlkit.parse(self.path.read_text())
+        self.assertEqual('personal', doc['profiles'][name]['model'])
+        self.assertEqual([name], list(doc['profiles']))
+        self.assertEqual('original', doc['model'])
+        import shlex
+        command = shlex.split(result['legacy_resume_command'])
+        self.assertEqual('CODEX_HOME=' + str(self.home.resolve()), command[1])
+        self.assertEqual(['-c', 'model_provider="qpool-desktop"', 'resume', '--all', '--include-non-interactive'], command[-5:])
+        self.assertEqual(1, result['legacy_recovered_count'])
+        self.assertEqual('qpool-desktop', result['compatibility_provider'])
+        self.assertNotIn('http_headers', doc['model_providers']['qpool-desktop'])
+
+    def test_recovery_report_and_stop_failures_keep_configuration_retryable(self):
+        from qp.codex_recovery import RecoveryResult
+        from qp.native import atomic
+        desktop.connect(self.native)
+        current = self.path.read_text()
+        previous_report = '{"resume_command":"previous", "thread_ids": []}'
+        report = self.root/'desktop-recovery.json'
+        report.write_text(previous_report)
+        def fail_report(path, *args, **kwargs):
+            if Path(path) == report:
+                raise PermissionError('report write failed')
+            return atomic(path, *args, **kwargs)
+        for failure in (patch('qp.native.atomic', side_effect=fail_report),
+                        patch('qp.desktop.remove_startup', side_effect=CollectorError('stop failed'))):
+            with failure, patch('qp.codex_recovery.recover',
+                    return_value=RecoveryResult(['old-id'], ['old-id'])):
+                with self.assertRaises((PermissionError, CollectorError)):
+                    desktop.restore(self.native)
+            self.assertEqual(current, self.path.read_text())
+            self.assertEqual(previous_report, report.read_text())
+            self.assertTrue(desktop.status(self.native)['connected'])
+            self.assertTrue((self.root/'desktop-key').exists())
+            self.assertTrue((self.root/'desktop-route.json').exists())
+
     def test_user_effort_change_does_not_disconnect_or_block_restore(self):
         desktop.connect(self.native)
         doc=tomlkit.parse(self.path.read_text());doc['model_reasoning_effort']='high'

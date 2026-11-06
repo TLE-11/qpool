@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import secrets
 import hmac
+import shlex
 import subprocess
 import sys
 import time
@@ -18,6 +19,11 @@ from .collectors.base import CollectorError
 
 KEYS = ('model', 'model_provider', 'model_catalog_json', 'model_reasoning_effort')
 PROVIDER = 'qpool-desktop'
+OFFICIAL_COMPATIBILITY = {
+    'name': 'OpenAI (restored qpool chats)',
+    'base_url': 'https://chatgpt.com/backend-api/codex',
+    'wire_api': 'responses', 'requires_openai_auth': True, 'supports_websockets': False,
+    'request_max_retries': 0, 'stream_max_retries': 0}
 
 
 def read_state(root):
@@ -52,14 +58,24 @@ def status(native):
     result = {'connected': False, 'can_restore': bool(state),
               'config_path': str(Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'config.toml'),
               'startup': '登录后自动维护后台', 'error': getattr(native, 'desktop_error', None)}
+    report_path = native.root / 'desktop-recovery.json'
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text())
+            result['legacy_resume_command'] = report['resume_command']
+            result['legacy_recovered_count'] = len(report['thread_ids'])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     if state:
         result.update(config_path=state['config_path'], backup_path=state['backup_path'])
-        result['needs_upgrade'] = not state['provider'].get('requires_openai_auth', False) or not state.get('legacy_enabled')
+        result['hot_switch'] = bool(state.get('hot_switch'))
+        result['switch_mode'] = state.get('switch_mode')
+        result['needs_upgrade'] = not state.get('hot_switch') and (not state['provider'].get('requires_openai_auth', False) or not state.get('legacy_enabled'))
         try:
             _, doc = read_config(Path(state['config_path']))
             result['connected'] = (all(doc.get(k) == v for k, v in state['managed'].items()
                                        if k != 'model_reasoning_effort') and
-                                   doc.get('model_providers', {}).get(state.get('provider_id', 'qpool')) == state['provider'])
+                                   (state.get('hot_switch') or doc.get('model_providers', {}).get(state.get('provider_id', 'qpool')) == state['provider']))
             if not result['connected']:
                 result['error'] = 'Codex 配置已变化，当前未完整使用 qpool 设置'
         except (OSError, ValueError, CollectorError):
@@ -79,6 +95,8 @@ def connect(native):
     if doc.get('openai_base_url') not in (None, legacy_url):
         raise CollectorError('已有其他 OpenAI 网关地址，未覆盖；旧聊天入口未启用')
     previous = read_state(native.root)
+    if previous and previous.get('hot_switch'):
+        raise CollectorError('已接入常驻入口，请使用原生/qpool切换按钮；未改写提供方')
     if previous:
         if not status(native)['connected']:
             raise CollectorError('已有桌面接入记录且配置已变化，请先恢复原配置后重新接入')
@@ -187,7 +205,7 @@ def restore(native):
             raise CollectorError('Codex 的模型设置已在外部修改，未覆盖；原配置备份保留在接入状态中')
     providers = doc.get('model_providers', {})
     provider_id = state.get('provider_id', 'qpool')
-    if providers.get(provider_id) not in (None, state['provider']):
+    if not state.get('hot_switch') and providers.get(provider_id) not in (None, state['provider']):
         raise CollectorError('qpool 提供方已在外部修改，未覆盖；请检查原配置备份')
     for key in state['managed']:
         if key == 'model_reasoning_effort' and doc.get(key) != state['managed'].get(key):
@@ -196,22 +214,54 @@ def restore(native):
             doc[key] = before[key]
         else:
             doc.pop(key, None)
-    providers.pop(provider_id, None)
+    if not state.get('hot_switch'):
+        providers.pop(provider_id, None)
     if not providers and 'model_providers' not in before:
         doc.pop('model_providers', None)
+    report_path = native.root / 'desktop-recovery.json'
+    previous_report = report_path.read_text() if report_path.exists() else None
+    from .codex_recovery import BINARY, recover
+    recovery_report = None
+    if not state.get('hot_switch'):
+        recovered = recover(path.parent, provider_id, before.get('model'), native.root, before.get('model_provider', 'openai'))
+        compatibility_ids = getattr(recovered, 'compatibility_ids', [])
+        if compatibility_ids:
+            # The engine pins old IDs. Restore the default provider while giving
+            # those chats an explicitly selected official OAuth transport.
+            doc.setdefault('model_providers', parser().table())[provider_id] = dict(OFFICIAL_COMPATIBILITY)
+            override = 'model_provider=' + json.dumps(provider_id)
+            recovery_report = {'provider_id': provider_id,
+                'thread_ids': compatibility_ids, 'created': time.time(),
+                'resume_command': 'env ' + shlex.quote('CODEX_HOME=' + str(path.parent.resolve())) +
+                    ' ' + shlex.quote(BINARY) + ' --no-daemon -c ' + shlex.quote(override) + ' resume --all --include-non-interactive',
+                'account_policy': 'Uses the current Codex OAuth login, not the prior qpool routing account.'}
     # Exact restoration when unchanged; otherwise retain unrelated later edits.
     rendered = original if doc.unwrap() == before.unwrap() else parser().dumps(doc)
-    from .codex_recovery import recover
-    recover(path.parent, provider_id, before.get('model'), native.root, before.get('model_provider', 'openai'))
     if path.read_text() != current:
         raise CollectorError('Codex 配置刚被其他操作修改，未覆盖；请重试')
-    atomic(path, rendered)
-    remove_startup(native.root)
+    report_written = False
+    try:
+        atomic(path, rendered)
+        if recovery_report:
+            atomic(report_path, recovery_report)
+            report_written = True
+        remove_startup(native.root)
+    except Exception as exc:
+        if path.read_text() == rendered:
+            atomic(path, current)
+        if report_written and report_path.exists() and json.loads(report_path.read_text()) == recovery_report:
+            if previous_report is None:
+                report_path.unlink()
+            else:
+                atomic(report_path, previous_report)
+        detail = ('；部分聊天可能已恢复模型，请重试恢复后再继续旧聊天'
+                  if not state.get('hot_switch') else '，请重试断开')
+        raise CollectorError('恢复收尾失败，接入记录已保留' + detail) from exc
     (native.root / 'desktop-key').unlink(missing_ok=True)
     (native.root / 'desktop.json').unlink()
     (native.root / 'desktop-route.json').unlink(missing_ok=True)
     native.desktop_error = None
-    return status(native)
+    return dict(status(native), compatibility_provider=provider_id if recovery_report else None)
 
 
 def authorized(native, headers):
@@ -348,7 +398,7 @@ def health(root, port):
 def token(root):
     root = Path(root)
     state = read_state(root)
-    if not state or not (root / 'desktop-route.json').exists():
+    if not state or (not state.get('hot_switch') and not (root / 'desktop-route.json').exists()):
         raise CollectorError('qpool 桌面路由已停用，请在控制台启用')
     # Serialize simultaneous desktop auth refreshes without starting duplicate servers.
     with open(root / 'desktop-start.lock', 'a') as lock:
@@ -376,6 +426,9 @@ def token(root):
                     if process.poll() is not None or time.monotonic() >= until:
                         raise CollectorError('qpool 后台未能启动，请打开本地控制台检查')
                     time.sleep(0.1)
+        if state.get('hot_switch') and not live.get('active'):
+            # The stable native transport remains available with routing disabled.
+            return None
         if not live.get('active'):
             raise CollectorError('qpool 路由未启用，请在本地控制台启用')
         entry = json.loads((root / 'entry.json').read_text())

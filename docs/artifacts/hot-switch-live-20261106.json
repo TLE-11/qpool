@@ -1,0 +1,266 @@
+{
+  "date": "2026-11-06",
+  "base": "main@1e4924216513ce1cf0f0e5d383215febf9800596",
+  "engine": "codex-cli 0.166.0-alpha.6",
+  "test_kind": "isolated real app-server and production HTTP endpoints; existing subscriptions; no desktop UI automation",
+  "cross_account": true,
+  "original_files_unchanged": true,
+  "config_unchanged_during_switches": true,
+  "limitations": [
+    "Initial connection to an existing direct chat requires a reload.",
+    "Both modes require the local gateway.",
+    "Existing legacy qpool provider threads are not automatically migrated.",
+    "Protocol-turn compaction and account-change guards were subsequently strengthened and checked with local regression tests."
+  ],
+  "stages": [
+    {
+      "stage": "native-created-with-tool",
+      "mode": "native",
+      "thread_id": "01a1af07-7473-71b3-ab33-20a6e2812f29",
+      "engine_pid": 27109,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "commandExecution",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        },
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ]
+    },
+    {
+      "stage": "native-to-qpool",
+      "mode": "qpool",
+      "thread_id": "01a1af07-7473-71b3-ab33-20a6e2812f29",
+      "engine_pid": 27109,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": null
+        }
+      ]
+    },
+    {
+      "stage": "native-qpool-native",
+      "mode": "native",
+      "thread_id": "01a1af07-7473-71b3-ab33-20a6e2812f29",
+      "engine_pid": 27109,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ]
+    },
+    {
+      "stage": "qpool-created-with-tool",
+      "mode": "qpool",
+      "thread_id": "01a1af07-c24c-7651-8c86-e19707d3154e",
+      "engine_pid": 27594,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage",
+        "commandExecution",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": null
+        },
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": null
+        }
+      ]
+    },
+    {
+      "stage": "qpool-to-native",
+      "mode": "native",
+      "thread_id": "01a1af07-c24c-7651-8c86-e19707d3154e",
+      "engine_pid": 27594,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ]
+    },
+    {
+      "stage": "qpool-native-qpool",
+      "mode": "qpool",
+      "thread_id": "01a1af07-c24c-7651-8c86-e19707d3154e",
+      "engine_pid": 27594,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": null
+        }
+      ]
+    },
+    {
+      "stage": "native-second-qpool",
+      "mode": "qpool",
+      "thread_id": "01a1af07-7473-71b3-ab33-20a6e2812f29",
+      "engine_pid": 27109,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": null
+        }
+      ]
+    },
+    {
+      "stage": "native-second-native",
+      "mode": "native",
+      "thread_id": "01a1af07-7473-71b3-ab33-20a6e2812f29",
+      "engine_pid": 27109,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ]
+    },
+    {
+      "stage": "qpool-second-native",
+      "mode": "native",
+      "thread_id": "01a1af07-c24c-7651-8c86-e19707d3154e",
+      "engine_pid": 27594,
+      "same_process": true,
+      "same_thread": true,
+      "history_recalled": true,
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "passed": true,
+      "receipts": [
+        {
+          "status": "completed",
+          "model": "gpt-6.1-sol",
+          "actual_model": "gpt-6.1-sol",
+          "entry_mode": "native"
+        }
+      ]
+    }
+  ],
+  "regression": {
+    "new_hot_switch_tests": {
+      "passed": 19,
+      "failed": 0
+    },
+    "full_suite": {
+      "total": 194,
+      "passed": 194,
+      "errors": 0,
+      "seconds": 103.854
+    },
+    "independent_review": "No remaining concrete blockers after hot-switch boundary fixes and final legacy recovery review.",
+    "legacy_recovery": {
+      "baseline_failure_reproduced_on_clean_main": true,
+      "resolution": "Keep the old provider ID with an explicit official OAuth compatibility command; restore the native default.",
+      "engine": "codex-cli 0.166.0-alpha.6",
+      "coverage": [
+        "Final restored config opens new threads with openai",
+        "Old thread IDs and history remain intact",
+        "Archived thread stays archived",
+        "codex-auto-review model remains unchanged",
+        "Partial model recovery plus failed cleanup can be retried successfully",
+        "Generated command pins the intended CODEX_HOME despite a conflicting parent environment",
+        "Config/report/startup failures preserve recovery state; partial model changes require retry"
+      ],
+      "no_model_inference": true,
+      "limitations": [
+        "Explicit compatibility command required for old-provider chats",
+        "Uses current native OAuth identity; cross-account encrypted history inference is not verified"
+      ]
+    },
+    "final_targeted_recheck": {
+      "passed": 43,
+      "failed": 0
+    }
+  }
+}

@@ -175,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
-        if path.startswith('/legacy/v1/'):
+        if path.startswith(('/legacy/v1/', '/switch/v1/')):
             # Tell the built-in client to fall back to its supported HTTP/SSE transport.
             self.protocol_version = 'HTTP/1.1'
             self.respond(426, {'error': 'Use HTTP Responses streaming'})
@@ -206,6 +206,10 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(500, {"error": "无法读取本地数据，请检查配置和文件权限"})
 
     def do_POST(self):
+        if self.path.startswith('/switch/v1/'):
+            from .desktop_switch import handle
+            handle(self, self.path)
+            return
         if self.path.startswith(("/v1/", "/legacy/v1/")):
             from .gateway import handle
             handle(self, self.path)
@@ -245,6 +249,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/desktop/connect":
                 with app.config_lock:
                     result = desktop.connect(app.native)
+            elif path == "/api/desktop/hot-connect":
+                from . import desktop_switch
+                with app.config_lock:
+                    result = desktop_switch.connect(app.native)
+            elif path == "/api/desktop/mode":
+                from . import desktop_switch
+                with app.config_lock:
+                    result = desktop_switch.set_mode(app.native, data.get('mode'))
             elif path == "/api/desktop/restore":
                 with app.config_lock:
                     result = desktop.restore(app.native)
