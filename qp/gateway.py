@@ -33,6 +33,7 @@ def handle(handler, path):
         handler.respond(429, {'error': {'message': 'qpool 当前已有 4 个请求运行，请稍后重试'}})
         return
     adapter_lock = None
+    request_guard = None
     upstream = None
     receipt = None
     started = time.time()
@@ -61,6 +62,13 @@ def handle(handler, path):
         if not isinstance(body, dict):
             raise CollectorError('请求必须是对象')
         approval = body.get('model') == 'codex-auto-review' and not path.endswith('/compact')
+        if not approval:
+            raw_session = handler.headers.get('session_id') or handler.headers.get('thread-id') or handler.headers.get('x-codex-session-id') or body.get('prompt_cache_key')
+            if not isinstance(raw_session, str) or not 0 < len(raw_session) <= 512:
+                raise CollectorError('请求缺少 Codex 会话标识')
+            from .native import digest
+            request_guard = native.turn_lock(('request', digest(raw_session)[:16]))
+            request_guard.__enter__()
         approval_account = desktop.legacy_account(native, handler.headers) if approval else None
         # Compaction may omit model and reuse an already validated session binding.
         if not approval and not legacy and body.get('model') != 'qpool-auto' and not (path.endswith('/compact') and 'model' not in body):
@@ -179,4 +187,6 @@ def handle(handler, path):
         finally:
             if adapter_lock:
                 adapter_lock.release()
+            if request_guard:
+                request_guard.__exit__(None, None, None)
             native.slots.release()

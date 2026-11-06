@@ -1,0 +1,211 @@
+{
+  "date": "2026-11-06",
+  "engine": "codex-cli 0.166.0-alpha.6",
+  "production_reconnected": false,
+  "full_gui_gateway_regression": "blocked: host ignores project endpoint; browser baseline has no gateway receipt",
+  "main_config_sha256": "cb18547233ce07a78de5458d06a4bfd386089bb6a0c3692de25727af3df7bcf0",
+  "real_judgments": [
+    {
+      "case": "test-run",
+      "expected": "regular",
+      "group": "regular",
+      "fallback": false,
+      "source": "model",
+      "model": "gpt-5.6-luna",
+      "actual_model": "gpt-5.6-luna",
+      "reason": "任务分工：测试／验证／失败分析或常规文字",
+      "input_tokens": 480,
+      "output_tokens": 36,
+      "passed": true
+    },
+    {
+      "case": "test-framework",
+      "expected": "regular",
+      "group": "regular",
+      "fallback": false,
+      "source": "model",
+      "model": "gpt-5.6-luna",
+      "actual_model": "gpt-5.6-luna",
+      "reason": "任务分工：测试／验证／失败分析或常规文字",
+      "input_tokens": 488,
+      "output_tokens": 80,
+      "passed": true
+    },
+    {
+      "case": "failure-analysis",
+      "expected": "regular",
+      "group": "regular",
+      "fallback": false,
+      "source": "model",
+      "model": "gpt-5.6-luna",
+      "actual_model": "gpt-5.6-luna",
+      "reason": "任务分工：测试／验证／失败分析或常规文字",
+      "input_tokens": 488,
+      "output_tokens": 87,
+      "passed": true
+    },
+    {
+      "case": "code-review",
+      "expected": "primary",
+      "group": "primary",
+      "fallback": false,
+      "source": "model",
+      "model": "gpt-5.6-luna",
+      "actual_model": "gpt-5.6-luna",
+      "reason": "任务分工：开发／方案／代码 Review",
+      "input_tokens": 488,
+      "output_tokens": 70,
+      "passed": true
+    },
+    {
+      "case": "implementation",
+      "expected": "primary",
+      "group": "primary",
+      "fallback": false,
+      "source": "model",
+      "model": "gpt-5.6-luna",
+      "actual_model": "gpt-5.6-luna",
+      "reason": "任务分工：开发／方案／代码 Review",
+      "input_tokens": 484,
+      "output_tokens": 36,
+      "passed": true
+    },
+    {
+      "case": "proposal",
+      "expected": "primary",
+      "group": "primary",
+      "fallback": false,
+      "source": "model",
+      "model": "gpt-5.6-luna",
+      "actual_model": "gpt-5.6-luna",
+      "reason": "任务分工：开发／方案／代码 Review",
+      "input_tokens": 487,
+      "output_tokens": 36,
+      "passed": true
+    }
+  ],
+  "copied_old_chat_engine": [
+    {
+      "stage": "old-pro-history",
+      "engine_status": "completed",
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "latest_receipt": [
+        "li…@163.com · pro",
+        "gpt-6.1-sol",
+        "completed",
+        "gpt-6.1-sol"
+      ]
+    },
+    {
+      "stage": "migrated-plus-history",
+      "engine_status": "completed",
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "latest_receipt": [
+        "li…@gmail.com · plus",
+        "gpt-6.1-sol",
+        "completed",
+        "gpt-6.1-sol"
+      ]
+    },
+    {
+      "stage": "test-framework-sol",
+      "engine_status": "completed",
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "latest_receipt": [
+        "li…@gmail.com · plus",
+        "gpt-6.1-sol",
+        "completed",
+        "gpt-6.1-sol"
+      ]
+    },
+    {
+      "stage": "code-review-astra",
+      "engine_status": "completed",
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "latest_receipt": [
+        "li…@gmail.com · plus",
+        "gpt-6-astra",
+        "completed",
+        "gpt-6-astra"
+      ]
+    },
+    {
+      "stage": "same-plan-reenabled",
+      "engine_status": "completed",
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "latest_receipt": [
+        "li…@gmail.com · plus",
+        "gpt-6.1-sol",
+        "completed",
+        "gpt-6.1-sol"
+      ]
+    },
+    {
+      "stage": "after-gateway-restart",
+      "engine_status": "completed",
+      "item_types": [
+        "userMessage",
+        "agentMessage"
+      ],
+      "latest_receipt": [
+        "li…@gmail.com · plus",
+        "gpt-6.1-sol",
+        "completed",
+        "gpt-6.1-sol"
+      ]
+    }
+  ],
+  "isolated_exhaustion_real_fallback": {
+    "fixture": "Plus exhausted in isolated snapshot only",
+    "actual_inference": [
+      "li…@163.com · pro",
+      "gpt-6-astra",
+      "completed"
+    ],
+    "api_used": false,
+    "note": "Plus decision quota is also blocked; conservative primary fallback is expected"
+  },
+  "native_browser_roundtrip": {
+    "model": "gpt-6.1-sol",
+    "status": "completed",
+    "native_observation": {
+      "tool": "mcp__cua_repl.js / IAB",
+      "url": "http://127.0.0.1:58289/#routes",
+      "activeRouteVisible": true,
+      "regularSolVisible": true,
+      "primaryAstraVisible": true,
+      "screenshot": "/Users/liwenqiang/Documents/qpool/docs/artifacts/isolated-regression-20261106/routes.jpg",
+      "errorLogs": [],
+      "settingsChanged": false,
+      "executionMode": "host-native-browser-relay; not a full GUI chat routing claim"
+    }
+  },
+  "source_sha256": {
+    "qp/native.py": "c36bfbe180ae07f35dfedb2dd5a2b118997b77feb2bb6f581d8511de9ffc5625",
+    "qp/gateway.py": "a1196da0a125b77cec1a17c287371d7fb70ee37d1d6c18b9cd715406c4e3304f",
+    "qp/decisions.py": "9a9ccacaf3030be12314558d4b44d09d48da319c92776fd8918b4fc0cfc69812",
+    "qp/desktop.py": "e1169bd82e1ba1b719cc13c3032b19011f0a620af7f4d63fafebd255a243968e",
+    "qp/codex_recovery.py": "a91abe8a05c84aa9c49bd085b9f9bc1a89c89ea602b9941e88ea282801ae7975",
+    "qp/web.py": "40b253e3c2a16dfb5c5315c9d1fcb6fc73f0aa984871cb5ad1062d531b496d47",
+    "qp/static/app.js": "e2d14cac668b6b324e19354956fd2a0d505578a91fe43b76fade571eb843d336"
+  },
+  "execution_status_counts": {
+    "completed": 10
+  },
+  "api_execution_count": 0
+}

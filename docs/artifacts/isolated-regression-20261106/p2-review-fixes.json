@@ -1,0 +1,47 @@
+{
+  "scope": [
+    "restore bound chats without receipts; fail closed for unknown aliases and incomplete ownership data",
+    "separate authentication identity and current execution source during explicit migration"
+  ],
+  "branch": "codex/isolated-desktop-regression",
+  "validation": {
+    "full_suite": {
+      "passed": 218,
+      "seconds": 111.085
+    },
+    "desktop_tests": 31,
+    "migration_tests": 18,
+    "protocol_tests": 4,
+    "compileall": "passed",
+    "diff_check": "passed",
+    "protocol": "Installed bundled Codex engine, temporary homes, no inference: unknown alias prevents config removal; known binding without receipt restores same ID/history to a real official model."
+  },
+  "compatibility": {
+    "schema_changed": false,
+    "current_code_reads_original_migration_snapshots": true,
+    "old_binary_downgrade": "Finish pending migrations before downgrade; schema compatibility does not imply old code understands a different execution source."
+  },
+  "boundaries": {
+    "real_model_inference": false,
+    "gui_retest": false,
+    "production_enabled": false,
+    "current_chat_connected": false,
+    "official_provider": "openai",
+    "official_builtin_endpoint_configured": false,
+    "production_desktop_state": false,
+    "qpool_launchagents": 0,
+    "confirmed_closed_ports": [
+      8765,
+      50338
+    ]
+  },
+  "independent_review": "Read-only final code and test review; no new explicit blocker found in the two-fix scope. Reviewer did not independently execute tests.",
+  "source_sha256": {
+    "qp/desktop.py": "db413f958212ed4745c70b26ec6b22fbd66081768d41ad631d1fb5f82dc60ab5",
+    "qp/codex_recovery.py": "411bcd658fbd15d9a965536cede26d2cd1a20fd752b492b71862011d9f18b361",
+    "qp/native.py": "835804f844206bfc4434818ea0af1ca881b84a3903b9630868a4e316df01e6ab",
+    "tests/test_desktop.py": "cd80a67998886963a3aef11277bb3f0a39300cd9333cc87019ca8b85c1c4d395",
+    "tests/test_codex_recovery.py": "d2aa864f536a05e1a529e41a9ec1a0b239a29cc402cb62368912eefec2407493",
+    "tests/test_migrations.py": "cdeb7c34c98758dfcd874c67bf3e37cb5df03dcfa3770b9f7747d47492f7216f"
+  }
+}

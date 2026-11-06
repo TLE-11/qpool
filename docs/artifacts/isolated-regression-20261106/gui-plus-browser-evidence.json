@@ -1,0 +1,226 @@
+{
+  "result": "passed_for_authorized_old_chat_copy_migration_and_native_iab",
+  "thread": "01a19033-8638-7902-8ab1-4001e14a8c75",
+  "session": "cc567c877388f5c8",
+  "gateway_port": 50338,
+  "gateway_receipts": [
+    {
+      "id": "f56caea1985fea7f6a6b4144",
+      "session": "cc567c877388f5c8",
+      "account": "li…@163.com · pro",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938313.54043,
+      "duration": 7.9484288692474365,
+      "input_tokens": 194580,
+      "output_tokens": 9,
+      "error": null,
+      "started_local": "2026-11-06T12:11:53.540430+08:00"
+    },
+    {
+      "id": "3aa346b2b1cf41b37bf8e512",
+      "session": "cc567c877388f5c8",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938587.701034,
+      "duration": 9.372784852981567,
+      "input_tokens": 206816,
+      "output_tokens": 109,
+      "error": null,
+      "started_local": "2026-11-06T12:16:27.701034+08:00"
+    },
+    {
+      "id": "75b9dca9edd633e1a1a146f8",
+      "session": "cc567c877388f5c8",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938611.261475,
+      "duration": 5.443960905075073,
+      "input_tokens": 219237,
+      "output_tokens": 46,
+      "error": null,
+      "started_local": "2026-11-06T12:16:51.261475+08:00"
+    },
+    {
+      "id": "7fd9c266a7e7c92f231883a2",
+      "session": "cc567c877388f5c8",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938618.3533812,
+      "duration": 5.196826934814453,
+      "input_tokens": 220657,
+      "output_tokens": 45,
+      "error": null,
+      "started_local": "2026-11-06T12:16:58.353381+08:00"
+    },
+    {
+      "id": "b3ae0782c9506e3549411101",
+      "session": "cc567c877388f5c8",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938625.014861,
+      "duration": 9.309823036193848,
+      "input_tokens": 221334,
+      "output_tokens": 185,
+      "error": null,
+      "started_local": "2026-11-06T12:17:05.014861+08:00"
+    },
+    {
+      "id": "fa6a36b010d40264139549c0",
+      "session": "cc567c877388f5c8",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938635.553656,
+      "duration": 4.869469881057739,
+      "input_tokens": 222096,
+      "output_tokens": 26,
+      "error": null,
+      "started_local": "2026-11-06T12:17:15.553656+08:00"
+    },
+    {
+      "id": "93b4aea98582ee31ae6eafd5",
+      "session": "cc567c877388f5c8",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "actual_model": "gpt-6.1-sol",
+      "status": "completed",
+      "started": 1793938640.5816262,
+      "duration": 10.076866865158081,
+      "input_tokens": 222154,
+      "output_tokens": 247,
+      "error": null,
+      "started_local": "2026-11-06T12:17:20.581626+08:00"
+    }
+  ],
+  "all_request_counts": [
+    {
+      "account": "li…@163.com · pro",
+      "status": "completed",
+      "count": 13
+    },
+    {
+      "account": "li…@gmail.com · plus",
+      "status": "completed",
+      "count": 6
+    }
+  ],
+  "migration": {
+    "source": "codex-dc804ba89e83",
+    "target": "codex-4a67781596ca",
+    "state": "selected"
+  },
+  "final_execution_account": "codex-4a67781596ca",
+  "browser_calls": [
+    {
+      "call_id": "call_ffa330347fc14f1db3bf5f810291d44a",
+      "timestamp": "2026-11-06T04:16:36.937Z",
+      "code": "var acceptanceTab = await cua.createBrowserTab(\"iab\", \"http://127.0.0.1:50338/#routes\", {visible:true});",
+      "completion_summary": null
+    },
+    {
+      "call_id": "call_69df5da4606146d49302cb3a614cdccb",
+      "timestamp": "2026-11-06T04:16:56.597Z",
+      "code": "await acceptanceTab.click(7); await acceptanceTab.getAXState();",
+      "completion_summary": null
+    },
+    {
+      "call_id": "call_b5e964ffaa34418086dc05006265242f",
+      "timestamp": "2026-11-06T04:17:03.364Z",
+      "code": "await acceptanceTab.click(10); await acceptanceTab.getAXState();",
+      "completion_summary": null
+    },
+    {
+      "call_id": "call_badca69a011f4b21b3a3c31531e295d2",
+      "timestamp": "2026-11-06T04:17:14.030Z",
+      "code": "var acceptanceErrors = await acceptanceTab.dev.logs({levels:[\"error\"],limit:50}); nodeRepl.write(acceptanceErrors); var acceptanceShot = await acceptanceTab.screenshot({fullPage:true}); await nodeRepl.emitImage(acceptanceShot); var acceptanceFs = await import(\"node:fs/promises\"); await acceptanceFs.mkdir(\"/Users/liwenqiang/Documents/Codex/2026-10-31/qpool-browser-desktop-regression/outputs\",{recursive:true}); await acceptanceFs.writeFile(\"/Users/liwenqiang/Documents/Codex/2026-10-31/qpool-browser-desktop-regression/outputs/gui-50338-routes-20261106.jpg\",acceptanceShot);",
+      "completion_summary": null
+    },
+    {
+      "call_id": "call_cbbdf3d66c454b94aa96da090f54cbe2",
+      "timestamp": "2026-11-06T04:17:20.302Z",
+      "code": null,
+      "completion_summary": "Verified isolated browser acceptance"
+    }
+  ],
+  "observations": {
+    "native_iab_open": true,
+    "account_navigation": true,
+    "return_to_routes": true,
+    "screenshot_returned_as_image": true,
+    "console_error_logs": [],
+    "history_marker_recalled": "GUI_HISTORY_1106",
+    "copied_history_preserves_source_bytes": true,
+    "source_chat_unchanged": true,
+    "main_config_unchanged": true
+  },
+  "screenshot": "docs/artifacts/isolated-regression-20261106/gui-plus-browser-routes.jpg",
+  "screenshot_sha256": "b0ee78bbe85e5bafedfe0f810e3cd6a3d6d9a5054bcce22d5a181a89e4b1fe61",
+  "boundaries": [
+    "Desktop launched and test prompt submitted by user; evidence checked from isolated persisted history and gateway receipts.",
+    "This test verifies explicit Pro-to-Plus migration with native IAB on one chat copy, not every plugin or every historical provider.",
+    "The first migrated turn keeps the original Sol model; this browser turn does not independently prove HiRoute task classification.",
+    "The isolated ledger also contains 13 Pro requests including the baseline and other sessions; 1 is explicitly codex-auto-review. Only the six target GUI conversation executions are all Plus."
+  ],
+  "cleanup": {
+    "temporary_login_copy_removed": true,
+    "source_main_config_sha256": "7e9a8ff1b0349a950969b9a5df6bdfa5127f6b9c459408e9b012022590e95940",
+    "source_history_unchanged": true,
+    "production_desktop_state": false,
+    "qpool_launchagents": 0,
+    "temporary_gateway_shutdown_requested": true,
+    "isolated_gui_window": "User may close the temporary desktop window; no app UI was controlled during verification.",
+    "production_and_test_ports_confirmed_closed": [
+      8765,
+      50338
+    ]
+  },
+  "all_route_counts": [
+    {
+      "route": "Codex native approval",
+      "account": "li…@163.com · pro",
+      "model": "codex-auto-review",
+      "status": "completed",
+      "count": 1
+    },
+    {
+      "route": "隔离回归 · 开发与测试分工",
+      "account": "li…@163.com · pro",
+      "model": "gpt-5.6-luna",
+      "status": "completed",
+      "count": 5
+    },
+    {
+      "route": "隔离回归 · 开发与测试分工",
+      "account": "li…@163.com · pro",
+      "model": "gpt-6-luna",
+      "status": "completed",
+      "count": 5
+    },
+    {
+      "route": "隔离回归 · 开发与测试分工",
+      "account": "li…@163.com · pro",
+      "model": "gpt-6.1-sol",
+      "status": "completed",
+      "count": 2
+    },
+    {
+      "route": "隔离回归 · 开发与测试分工",
+      "account": "li…@gmail.com · plus",
+      "model": "gpt-6.1-sol",
+      "status": "completed",
+      "count": 6
+    }
+  ],
+  "independent_review": "Read-only evidence and screenshot review agreed with the scoped result; no new GUI/model actions performed."
+}

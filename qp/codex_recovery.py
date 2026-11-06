@@ -7,11 +7,26 @@ import shutil
 import subprocess
 import threading
 import time
+import hashlib
 
 from .collectors.base import CollectorError
 
 
-def recover(home, provider, model, backup_root, original_provider='openai'):
+class RecoveryResult(list):
+    def __init__(self, values=(), compatibility_provider=False):
+        super().__init__(values)
+        self.compatibility_provider = compatibility_provider
+
+
+class ProviderMismatch(CollectorError):
+    pass
+
+
+def recover(home, provider, model, backup_root, original_provider='openai', *, managed_sessions=None,
+            require_owned_aliases=False):
+    """Optionally restore only known receipt sessions still using a qpool alias."""
+    if managed_sessions is not None and not managed_sessions and not require_owned_aliases:
+        return []
     home = Path(home)
     if not list(home.glob('state_*.sqlite')):
         return []
@@ -37,6 +52,10 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
             item = events.get(timeout=max(.01, until - time.monotonic()))
             if item.get('id') == ident:
                 if 'error' in item:
+                    if item['error'].get('data', {}).get('type') == 'modelProviderMismatch':
+                        raise ProviderMismatch('当前引擎要求保留聊天原提供方标识')
+                    if 'active writer' in item['error'].get('message', ''):
+                        raise CollectorError('聊天仍被桌面占用，请停止该聊天并关闭其占用后重试；提供方与历史备份保留')
                     raise CollectorError('Codex 未能恢复聊天；保留提供方配置和历史备份')
                 return item['result']
     try:
@@ -53,7 +72,15 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
                         'sourceKinds': ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
                                         'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'],
                         'archived': archived, 'cursor': cursor, 'limit': 100, 'useStateDbOnly': True})
-                    records.extend(page['data'])
+                    for row in page['data']:
+                        if managed_sessions is not None:
+                            sid = hashlib.sha256(row['id'].encode()).hexdigest()[:16]
+                            if (require_owned_aliases and sid not in managed_sessions
+                                    and (row.get('model') or '').startswith('qpool')):
+                                raise CollectorError('存在无法确认恢复模型的 qpool 聊天，保留接入配置与备份；请先为该聊天选择真实模型')
+                            if sid not in managed_sessions or not (row.get('model') or '').startswith('qpool'):
+                                continue
+                        records.append(dict(row, _qpool_archived=archived))
                     cursor = page.get('nextCursor')
                     if not cursor:
                         break
@@ -61,7 +88,7 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
         records = list_managed()
         if not records:
             return []
-        if not model or model.startswith('qpool'):
+        if managed_sessions is None and (not model or model.startswith('qpool')):
             raise CollectorError('原配置未提供可恢复的官方模型，保留接入配置')
         if original_provider != 'openai':
             raise CollectorError('原提供方不是官方 OpenAI，保留配置以便人工恢复聊天')
@@ -69,6 +96,7 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
         backup_root = Path(backup_root) / ('chat-recovery-' + str(time.time_ns()))
         backup_root.mkdir(parents=True, mode=0o700)
         atomic(backup_root / 'before.json', records)
+        compatibility_ids = set()
         for row in records:
             source = Path(row['path'])
             if not source.resolve().is_relative_to(home.resolve()):
@@ -77,11 +105,37 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
             shutil.copyfile(source, destination)
             destination.chmod(0o600)
         for row in records:
-            result = call(next(sequence), 'thread/resume', {'threadId': row['id'], 'modelProvider': 'openai',
-                                                 'model': model, 'excludeTurns': True})
-            if result['thread']['id'] != row['id'] or result['modelProvider'] != 'openai':
-                raise CollectorError('聊天恢复结果不匹配，保留提供方配置')
-        if list_managed():
+            previous_model = row.get('model')
+            if managed_sessions is not None:
+                sid = hashlib.sha256(row['id'].encode()).hexdigest()[:16]
+                target_model = managed_sessions[sid]
+                if not isinstance(target_model, str) or not target_model or target_model.startswith('qpool'):
+                    raise CollectorError('已知聊天缺少可恢复的真实模型，保留接入配置')
+            else:
+                target_model = previous_model if previous_model and not previous_model.startswith('qpool') else model
+            unarchived = False
+            try:
+                if row['_qpool_archived']:
+                    call(next(sequence), 'thread/unarchive', {'threadId': row['id']})
+                    unarchived = True
+                target_provider = 'openai'
+                try:
+                    result = call(next(sequence), 'thread/resume', {'threadId': row['id'], 'modelProvider': target_provider,
+                                                         'model': target_model, 'excludeTurns': True})
+                except ProviderMismatch:
+                    # Newer engines pin provider IDs. Preserve the ID and let
+                    # desktop.restore replace its transport with official OAuth.
+                    target_provider = provider
+                    result = call(next(sequence), 'thread/resume', {'threadId': row['id'], 'modelProvider': provider,
+                                                         'model': target_model, 'excludeTurns': True})
+                    compatibility_ids.add(row['id'])
+                if (result['thread']['id'] != row['id'] or result['modelProvider'] != target_provider
+                        or result['model'] != target_model):
+                    raise CollectorError('聊天恢复结果不匹配，保留提供方配置')
+            finally:
+                if unarchived:
+                    call(next(sequence), 'thread/archive', {'threadId': row['id']})
+        if {r['id'] for r in list_managed()} - compatibility_ids:
             raise CollectorError('仍有聊天依赖 qpool，保留提供方配置，请重试恢复')
     except (OSError, queue.Empty, KeyError) as exc:
         raise CollectorError('聊天恢复失败；保留提供方配置和历史备份') from exc
@@ -93,4 +147,4 @@ def recover(home, provider, model, backup_root, original_provider='openai'):
             process.kill();process.wait()
         process.stdin.close()
         process.stdout.close()
-    return [row['id'] for row in records]
+    return RecoveryResult([row['id'] for row in records], bool(compatibility_ids))

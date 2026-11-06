@@ -236,6 +236,10 @@ class Native:
             conn.execute('CREATE INDEX IF NOT EXISTS requests_session ON requests(session)')
             conn.execute('CREATE TABLE IF NOT EXISTS legacy_bindings (session TEXT PRIMARY KEY, account TEXT NOT NULL, route TEXT NOT NULL, binding TEXT)')
             conn.execute('CREATE TABLE IF NOT EXISTS session_bindings (session TEXT PRIMARY KEY, route TEXT NOT NULL, binding TEXT NOT NULL)')
+            conn.execute('''CREATE TABLE IF NOT EXISTS legacy_migrations
+                (session TEXT PRIMARY KEY, source TEXT NOT NULL, target TEXT NOT NULL,
+                 route TEXT NOT NULL, previous_binding TEXT NOT NULL, user_count INTEGER NOT NULL,
+                 state TEXT NOT NULL, created REAL NOT NULL)''')
             conn.execute("UPDATE requests SET status='interrupted', error='服务重启，结果未确认' WHERE status='running'")
         os.chmod(self.receipt_path, 0o600)
         # Grants are invalidated on restart until user enables a route again.
@@ -522,6 +526,36 @@ class Native:
                 route['decision'] = decision_settings
             raw['routes'] = [r for r in raw['routes'] if r['id'] != ident] + [route]
             self.catalog(route, write=False)
+            if data.get('apply_to_active') is True:
+                if not self.active or self.active['id'] != ident or not self.grant:
+                    raise CollectorError('只能原位发布当前活动方案')
+                # Prevent a new gateway request from starting during publication.
+                # Existing requests must finish, including adapter/stream cleanup.
+                with self.selection_lock:
+                    if any(k[0] == 'request' for k in self.turn_locks):
+                        raise CollectorError('仍有请求运行，未发布；请等待请求结束')
+                    old = self.active
+                    old_hash = digest(json.dumps(old, sort_keys=True))
+                    new_hash = digest(json.dumps(route, sort_keys=True))
+                    files = [self.path, self.root/'catalog.json', self.root/'desktop-route.json']
+                    before = {p:p.read_text() if p.exists() else None for p in files}
+                    try:
+                        with self.receipts() as conn:
+                            self.catalog(route)
+                            atomic(self.path, raw)
+                            conn.execute('UPDATE session_bindings SET route=? WHERE route=?', (new_hash, old_hash))
+                            conn.execute('UPDATE legacy_migrations SET route=? WHERE route=?', (new_hash, old_hash))
+                            self.active = route
+                            desktop.persist_route(self)
+                    except Exception:
+                        self.active = old
+                        for path, content in before.items():
+                            if content is None:
+                                path.unlink(missing_ok=True)
+                            else:
+                                atomic(path, content)
+                        raise
+                return route
             atomic(self.path, raw)
             # Editing an active route revokes its entry until explicitly enabled.
             if self.active and self.active['id'] == ident and self.active != route:
@@ -632,12 +666,18 @@ class Native:
     def status(self):
         with self.receipts() as conn:
             rows = [dict(row) for row in conn.execute('SELECT * FROM requests ORDER BY started DESC LIMIT 100')]
-            legacy_sessions = {row['session'] for row in conn.execute('SELECT session FROM legacy_bindings')}
+            legacy_sessions = {row['session']: json.loads(row['binding'] or '{}').get('automatic_account') is True
+                               for row in conn.execute('SELECT session,binding FROM legacy_bindings')}
+            migrations = {row['session']: dict(row) for row in conn.execute(
+                'SELECT session,source,target,state FROM legacy_migrations')}
             judgments = [dict(json.loads(row['detail']), id=row['id'], created=row['created'],
                          route=row['route'], session=row['session'], scope=row['scope']) for row in
                          conn.execute('SELECT * FROM decisions ORDER BY created DESC LIMIT 100')]
         for row in rows:
+            row['migration'] = migrations.get(row['session'])
             row['account_policy'] = ('原生审批：保留登录账号，不参与 Plus 优先' if row['route'] == 'Codex native approval'
+                                     else '已授权账号迁移；实际执行账号以本条回执为准' if row['migration']
+                                     else '自动路由：首次按方案顺序选账号，后续保持该账号' if legacy_sessions.get(row['session'])
                                      else '原生聊天：保留原账号，不参与 Plus 优先' if row['session'] in legacy_sessions
                                      else '自动路由：首次按方案顺序选账号，后续保持该账号')
         for ident, (process, since) in list(self.logins.items()):
@@ -701,6 +741,81 @@ class Native:
                 if slot[1] == 0:
                     self.turn_locks.pop(key, None)
 
+    def schedule_migration(self, data):
+        """Explicit subscription migration; authentication identity never changes."""
+        sid, target = data.get('session'), data.get('target_account_id')
+        if data.get('confirm') is not True or not isinstance(sid, str) or not re.fullmatch('[0-9a-f]{16}', sid):
+            raise CollectorError('请选择会话和目标订阅账号，并确认原地迁移')
+        # Same lock as the entire gateway request, not just model selection.
+        with self.turn_lock(('request', sid)):
+            route, grant = self.active, self.grant
+            if not route or not grant:
+                raise CollectorError('请先启用原聊天的路由方案')
+            with self.receipts() as conn:
+                saved = conn.execute('SELECT * FROM legacy_bindings WHERE session=?', (sid,)).fetchone()
+                prior = conn.execute('SELECT * FROM legacy_migrations WHERE session=?', (sid,)).fetchone()
+                running = conn.execute("SELECT 1 FROM requests WHERE session=? AND status='running'", (sid,)).fetchone()
+            if not saved or not saved['binding'] or (prior and prior['state'] != 'selected') or running:
+                raise CollectorError('会话尚未绑定、已有迁移计划或仍有请求运行，未修改')
+            binding = json.loads(saved['binding'])
+            if saved['route'] != route['id'] or type(binding.get('user_count')) is not int:
+                raise CollectorError('原路由或用户轮次边界未确认，未修改')
+            config = profiles.load()
+            source = saved['account']  # Native authentication identity stays fixed.
+            execution_source = binding['channel']['account_id']
+            if (execution_source == target or
+                    config['accounts'].get(target, {}).get('agent') != 'codex' or
+                    config['accounts'].get(source, {}).get('agent') != 'codex' or
+                    config['accounts'].get(execution_source, {}).get('agent') != 'codex'):
+                raise CollectorError('仅支持显式迁移到另一个已接入的订阅账号')
+            if prior:
+                if (prior['source'] != source or prior['target'] != execution_source or
+                        prior['route'] != digest(json.dumps(route, sort_keys=True))):
+                    raise CollectorError('原生身份或当前执行账号与迁移记录不一致，未修改')
+            elif execution_source != source and binding.get('automatic_account') is not True:
+                raise CollectorError('当前执行账号与原生绑定不一致，未修改')
+            # Migration verifies the source identity, not its remaining quota:
+            # an exhausted source is exactly when an explicit move is useful.
+            profiles.credentials(config['accounts'][source], codex)
+            if execution_source != source:
+                profiles.credentials(config['accounts'][execution_source], codex)
+            channel = self.migration_channel(config, route, target, binding['channel']['model'])
+            self.validate_migration_target(channel)
+            with self.lock:
+                if self.active != route or self.grant != grant:
+                    raise CollectorError('检查期间路由已变化，未修改')
+                with self.receipts() as conn:
+                    # previous_binding separately persists the execution source;
+                    # source remains the authentication identity for old readers.
+                    conn.execute('''INSERT INTO legacy_migrations VALUES (?,?,?,?,?,?,?,?)
+                        ON CONFLICT(session) DO UPDATE SET source=excluded.source,target=excluded.target,
+                        route=excluded.route,previous_binding=excluded.previous_binding,
+                        user_count=excluded.user_count,state=excluded.state,created=excluded.created''',
+                        (sid, source, target, digest(json.dumps(route, sort_keys=True)), saved['binding'],
+                         binding['user_count'], 'pending', time.time()))
+            return {'session': sid, 'state': 'pending', 'auth_account': source,
+                    'execution_source': execution_source, 'target_account': target,
+                    'message': '已安排：下一个可识别的新用户轮次切换；历史、原生登录和审批保持不变'}
+
+    @staticmethod
+    def migration_channel(config, route, target, model):
+        route_accounts = {c['account_id'] for c in config['channels']
+                          if c['id'] in route['regular'] + route['primary']}
+        channel = next((c for c in config['channels'] if c['account_id'] == target and c['model'] == model
+                        and target in route_accounts and c.get('type') == 'native'
+                        and c.get('available', True)), None)
+        if channel is None:
+            raise CollectorError('目标订阅未提供原模型或不在当前方案中，未切换账号')
+        return channel
+
+    def validate_migration_target(self, channel):
+        account = profiles.load()['accounts'][channel['account_id']]
+        profiles.credentials(account, codex)
+        self.validate_binding(channel)
+        adapter = self.adapter(account)
+        if channel['model'] not in adapter.models:
+            raise CollectorError('目标适配器尚未提供原模型，保留原账号绑定')
+
     def select(self, body, headers, compact=False, legacy_account=None):
         """Pin tool continuations; never silently replay a request on another model."""
         route = self.active
@@ -719,12 +834,17 @@ class Native:
             raise CollectorError("需要原生 Codex 的消息列表")
         users = [i for i in items if isinstance(i, dict) and i.get('role') == 'user']
         text = ''
+        content = []
         if users:
             content = users[-1].get('content', '')
             text = content if isinstance(content, str) else '\n'.join(c.get('text', '') for c in content
                       if isinstance(c, dict) and c.get('type') in ('input_text', 'text'))
+        has_task = bool(text.strip()) or (isinstance(content, list) and any(
+            isinstance(c, dict) and c.get('type') == 'input_image'
+            and (c.get('image_url') or c.get('file_id')) for c in content))
         key = (self.grant, route['id'], sid)
-        turn = digest(str(len(users)) + ':' + text)
+        turn_content = text if text else json.dumps(content, sort_keys=True)
+        turn = digest(str(len(users)) + ':' + turn_content)
         # Desktop may append tool catalogs or runtime instructions after tool
         # output; those metadata messages do not start a new user turn.
         tail = next((i for i in reversed(items) if isinstance(i, dict)
@@ -734,11 +854,27 @@ class Native:
                                  'computer_call_output', 'tool_search_output') or tail.get('role') == 'tool'))
         with self.turn_lock(key):
             verified_legacy = False
+            migration = None
+            execution_account = legacy_account
+            if legacy_account:
+                with self.receipts() as conn:
+                    migration = conn.execute('SELECT * FROM legacy_migrations WHERE session=?', (sid,)).fetchone()
+                if migration:
+                    if migration['source'] != legacy_account or migration['route'] != digest(json.dumps(route, sort_keys=True)):
+                        raise CollectorError('迁移的原生身份或路由已变化，请恢复原配置')
+                    if migration['state'] == 'selected':
+                        execution_account = migration['target']
+                    else:
+                        try:
+                            execution_account = json.loads(migration['previous_binding'])['channel']['account_id']
+                        except (ValueError, TypeError, KeyError) as exc:
+                            raise CollectorError('迁移的执行源记录无效，保留原账号绑定') from exc
             if not legacy_account:
                 with self.receipts() as conn:
                     if conn.execute('SELECT 1 FROM legacy_bindings WHERE session=?', (sid,)).fetchone():
                         raise CollectorError('此聊天已绑定原生入口，请使用原入口继续')
             binding = self.bindings.get(key)
+            automatic_account = False
             if not legacy_account and not binding:
                 with self.receipts() as conn:
                     saved = conn.execute('SELECT * FROM session_bindings WHERE session=?', (sid,)).fetchone()
@@ -747,8 +883,6 @@ class Native:
                         raise CollectorError('此聊天的路由设置已变化，请恢复原路由后继续')
                     binding = json.loads(saved['binding'])
             if legacy_account:
-                if binding and binding['channel']['account_id'] != legacy_account:
-                    raise CollectorError('此聊天已绑定其他账号，拒绝跨账号继续')
                 with self.receipts() as conn:
                     routed = conn.execute('SELECT binding FROM session_bindings WHERE session=?', (sid,)).fetchone()
                     if routed:
@@ -759,6 +893,13 @@ class Native:
                             raise CollectorError('旧聊天已绑定原账号与路由，请恢复对应账号和路由后继续')
                         if not binding and saved['binding']:
                             binding = json.loads(saved['binding'])
+                        automatic_account = bool(binding and binding.get('automatic_account') is True)
+                        if automatic_account and not migration:
+                            # Authentication stays native; only a previously
+                            # persisted automatic binding chooses execution.
+                            execution_account = binding['channel']['account_id']
+                        if binding and binding['channel']['account_id'] != execution_account:
+                            raise CollectorError('持久化账号与迁移状态不一致，拒绝重新选择账号')
                         if manual and binding and 'user_count' not in binding:
                             if requested != binding['channel']['model'] and (compact or binding['turn'] == turn):
                                 raise CollectorError('旧绑定的同轮或压缩请求不能更换模型')
@@ -769,12 +910,59 @@ class Native:
                     else:
                         if conn.execute('SELECT 1 FROM requests WHERE session=? LIMIT 1', (sid,)).fetchone():
                             raise CollectorError('此聊天已有其他入口的执行记录，不能自动重新绑定')
+                if not binding and not manual:
+                    # No assistant/reasoning/tool history can cross accounts
+                    # implicitly. Only the first user message of a fresh chat
+                    # may select an account independently of native login.
+                    def environment_message(item):
+                        value = item.get('content', '')
+                        if isinstance(value, list):
+                            if (len(value) != 1 or not isinstance(value[0], dict)
+                                    or value[0].get('type') not in ('input_text', 'text')):
+                                return False
+                            value = value[0].get('text', '')
+                        return (isinstance(value, str) and value.strip().startswith('<environment_context>')
+                                and value.strip().endswith('</environment_context>'))
+                    # The native engine adds a separate user message with its
+                    # environment before the actual first user task.
+                    fresh = len([i for i in users if not environment_message(i)]) == 1 and all(isinstance(i, dict)
+                        and i.get('role') in ('user', 'developer', 'system')
+                        and (i.get('type') in (None, 'message') or
+                             (i.get('role') == 'developer' and i.get('type') == 'additional_tools')) for i in items)
+                    if fresh and not compact:
+                        execution_account = None
+                        automatic_account = True
             if not binding:
                 with self.receipts() as conn:
                     seen = conn.execute('SELECT 1 FROM requests WHERE session=? LIMIT 1', (sid,)).fetchone()
                 if seen and not verified_legacy:
                     raise CollectorError('此会话的路由绑定已失效，请新建会话；不会跨账号迁移已有上下文')
+            if (migration and migration['state'] == 'pending' and binding and not continuation and has_task
+                    and len(users) > migration['user_count']
+                    and len(users) > binding.get('user_count', len(users))):
+                if manual and requested != binding['channel']['model']:
+                    raise CollectorError('首次迁移需保持原模型，请勿同时更换模型')
+                config = profiles.load()
+                channel = self.migration_channel(config, route, migration['target'], binding['channel']['model'])
+                self.validate_migration_target(channel)
+                moved = dict(binding, turn=turn, user_count=len(users), channel=channel,
+                             decision='已授权原地迁移：保留历史与原模型，执行账号切至目标订阅', decision_id=None)
+                with self.selection_lock:
+                    if self.grant != key[0]:
+                        raise CollectorError('入口已变化，未切换账号')
+                    with self.receipts() as conn:
+                        conn.execute('UPDATE legacy_migrations SET state=? WHERE session=?', ('selected', sid))
+                        conn.execute('UPDATE legacy_bindings SET binding=? WHERE session=?', (json.dumps(moved), sid))
+                    self.bindings[key] = moved
+                return moved, sid
             if binding and (continuation or binding['turn'] == turn) and (not manual or requested == binding['channel']['model']):
+                if (migration and migration['state'] == 'pending' and continuation
+                        and len(users) < migration['user_count']):
+                    # Compaction/tool reconstruction establishes a shorter
+                    # visible baseline, never a migration boundary by itself.
+                    with self.receipts() as conn:
+                        conn.execute('UPDATE legacy_migrations SET user_count=? WHERE session=? AND state=?',
+                                     (len(users), sid, 'pending'))
                 if binding.get('user_count') != len(users) or binding['turn'] != turn:
                     binding = dict(binding, turn=turn, user_count=len(users))
                     self.store_binding(key, route, sid, binding, legacy_account)
@@ -782,10 +970,10 @@ class Native:
             # A resumed native chat may end with historical browser/tool results.
             # Only an authenticated native account and an explicit real model can
             # seed this first binding; an automatic alias cannot infer that model.
-            native_resume = legacy_account and manual and not binding and bool(text)
+            native_resume = legacy_account and manual and not binding and has_task
             native_model_change = (legacy_account and manual and binding and not compact
                                    and len(users) > binding.get('user_count', len(users)))
-            if (continuation and not native_resume and not native_model_change) or not text:
+            if (continuation and not native_resume and not native_model_change) or not has_task:
                 raise CollectorError("未找到此轮会话的路由绑定，请新建会话后重试")
             judgment = None
             if manual:
@@ -796,8 +984,11 @@ class Native:
                 judgment = self.record_decision(self.decision_engine.run(route['decision'], text, items), route['name'], sid)
                 group, why = judgment['group'], judgment['reason']
             elif route['mode'] == 'decider':
-                decision = routing.decide(text, profiles.load()['routing'])
-                group, why = decision['group'], decision['reason']
+                if text.strip():
+                    decision = routing.decide(text, profiles.load()['routing'])
+                    group, why = decision['group'], decision['reason']
+                else:
+                    group, why = 'primary', '当前任务没有可评分文字，保守使用主力组'
             else:
                 # Conservative local fallback, explicitly not an LLM classifier.
                 simple = len(text) <= 800 and bool(re.search(r'翻译|translate|总结|摘要|summari[sz]e|润色|改写|拼写|格式化|你好|hello|只回复|reply.*only', text, re.I))
@@ -807,13 +998,14 @@ class Native:
             config = profiles.load()
             ids = route['primary'] if group == 'primary' else route['regular'] + route['primary']
             if manual:
-                ids = [c['id'] for c in config['channels'] if c['account_id'] == legacy_account and c['model'] == requested]
+                ids = [c['id'] for c in config['channels'] if c['account_id'] == execution_account and c['model'] == requested]
             by_id = {c['id']: c for c in config['channels']}
             account_order = list(dict.fromkeys(by_id[i]['account_id'] for i in ids if i in by_id))
             channels = [c for c in config['channels'] if c['id'] in ids and c.get('type') == 'native' and c.get('available', True)]
             primary_accounts = {c['account_id'] for c in channels if c['id'] in route['primary']}
             channels = [c for c in channels if (manual or c['account_id'] in primary_accounts)
-                        and (not legacy_account or c['account_id'] == legacy_account)]
+                        and (not execution_account or c['account_id'] == execution_account)
+                        and (not binding or c['account_id'] == binding['channel']['account_id'])]
             candidates = []
             subscription_unknown = False
             refreshed = set()
@@ -858,6 +1050,8 @@ class Native:
                 raise CollectorError('订阅额度尚未确认，暂不转入付费 API；请稍后重试额度同步')
             binding = {'turn': turn, 'user_count': len(users), 'channel': selected, 'decision': why, 'route': route['name'],
                        'decision_id': judgment['id'] if judgment else None}
+            if automatic_account:
+                binding['automatic_account'] = True
             self.store_binding(key, route, sid, binding, legacy_account)
             return binding, sid
 

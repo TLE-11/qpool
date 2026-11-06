@@ -236,8 +236,12 @@ class Handler(BaseHTTPRequestHandler):
                 result = app.native.sync_models(data.get('account_id'))
             elif path == "/api/routes/save":
                 result = app.native.save_route(data)
+            elif path == "/api/routes/apply":
+                result = app.native.save_route(dict(data, apply_to_active=True))
             elif path == "/api/agent/enable":
                 result = app.native.enable(data.get("route_id"))
+            elif path == "/api/sessions/migrate":
+                result = app.native.schedule_migration(data)
             elif path == "/api/agent/launch":
                 result = app.native.launch(data)
             elif path == "/api/agent/disable":
