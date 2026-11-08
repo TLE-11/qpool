@@ -70,6 +70,12 @@ Open <http://127.0.0.1:8765>.
 See the [local console guide](docs/local-console.md) for account setup, existing
 chat access, and restoring the original Codex configuration.
 
+For native ↔ qpool switching with different model context windows, use the
+optional [App Server model-sync entry](docs/app-server-routing.md). It selects
+the model before Codex prepares each turn. Initial desktop attachment needs one
+restart; subsequent ordinary chat turns switch without restarting. The guide
+includes live verification results and the current queued-followup limitation.
+
 ## See routing results
 
 Each request records the selected account and model, execution status, and

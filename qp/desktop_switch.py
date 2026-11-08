@@ -221,6 +221,19 @@ def handle(handler, path):
             # Check before persisting a turn pin, in either mode. A rejected
             # login must not prevent the original account from retrying.
             old_account = legacy_account(native, session, subject)
+            from . import control
+            plan = None if body.get('model') == 'codex-auto-review' else control.resolve(
+                native, body, handler.headers, session, subject, compact)
+            if plan:
+                model = plan['model']
+                if plan['mode'] == 'native':
+                    return forward_native(handler, path.replace(PREFIX, '/backend-api/codex', 1),
+                                          dict(body, model=model), session, subject)
+                from . import gateway
+                return gateway.handle(handler, path.replace(PREFIX, '/v1', 1),
+                    switch_body=dict(body, model='qpool-auto'), switch_model=model,
+                    switch_binding=plan['binding'], switch_grant=plan['grant'], switch_route=plan['route'],
+                    switch_legacy_account=old_account)
             # Approval calls are owned by the native login and must never enter
             # automatic model/account selection or overwrite the user's turn pin.
             if body.get('model') == 'codex-auto-review':
@@ -242,8 +255,9 @@ def handle(handler, path):
     except sqlite3.Error:
         native.audit_error = '桌面请求记录写入失败，请检查磁盘与权限后重启服务'
         handler.respond(502, {'error': {'message': native.audit_error}})
-    except (CollectorError, ValueError, OSError):
-        handler.respond(502, {'error': {'message': '桌面切换请求未完成；请检查登录、入口和本轮绑定，不会自动换账号重试'}})
+    except (CollectorError, ValueError, OSError) as exc:
+        handler.respond(502, {'error': {'message': str(exc) if isinstance(exc, CollectorError) else
+                        '桌面切换请求未完成；请检查登录、入口和本轮绑定，不会自动换账号重试'}})
 
 
 def validate_target(native, body, client_model, target_model):

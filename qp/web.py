@@ -257,6 +257,16 @@ class Handler(BaseHTTPRequestHandler):
                 from . import desktop_switch
                 with app.config_lock:
                     result = desktop_switch.connect(app.native)
+            elif path == "/api/desktop/control/install":
+                from . import control
+                with app.config_lock:
+                    result = control.install(app.native)
+            elif path == "/api/desktop/control/prepare":
+                from . import control
+                result = control.prepare(app.native, data, self.headers)
+            elif path == "/api/desktop/control/queue":
+                from . import control
+                result = control.queue_claim(app.native, data, self.headers)
             elif path == "/api/desktop/mode":
                 from . import desktop_switch
                 with app.config_lock:

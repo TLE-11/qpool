@@ -29,6 +29,10 @@ def main():
     parser.add_argument('--observe-transport', action='store_true', help='Log safe response protocol metadata only.')
     parser.add_argument('--legacy-upgrade', action='store_true',
                         help='Create an old OpenAI chat through /legacy, upgrade, then switch without reloads.')
+    parser.add_argument('--control', action='store_true', help='Use the real control proxy and route Sol to Astra.')
+    parser.add_argument('--control-compact', action='store_true',
+                        help='Force small-window model compaction with an isolated 32k catalog and injected filler.')
+    parser.add_argument('--control-queued', action='store_true', help='Use the desktop queued-followup protocol for pool turns.')
     args = parser.parse_args()
     from qp.native import atomic
     from qp import web, desktop_switch
@@ -40,6 +44,27 @@ def main():
     server = console = None
     source_home = Path.home() / '.codex'
     observer = None
+    http_observer = None
+    if args.observe_transport:
+        respond = web.Handler.respond
+        def observe_error(handler, status, value, *rest):
+            if status >= 400:
+                print(json.dumps({'http_error': status, 'detail': value}, ensure_ascii=False), flush=True)
+            if status == 401:
+                from qp import profiles
+                from qp.collectors import codex
+                checks = []
+                for account in profiles.load()['accounts'].values():
+                    try:
+                        creds = profiles.credentials(account, codex)
+                        checks.append({'id': account['id'], 'token_matches': handler.headers.get('Authorization') == 'Bearer ' + creds['access_token'],
+                                       'subject_matches': handler.headers.get('ChatGPT-Account-Id') == creds['account_id']})
+                    except Exception:
+                        checks.append({'id': account['id'], 'credentials_readable': False})
+                print(json.dumps({'auth_checks': checks}), flush=True)
+            return respond(handler, status, value, *rest)
+        http_observer = patch.object(web.Handler, 'respond', observe_error)
+        http_observer.start()
     if args.observe_transport:
         original_connection = desktop_switch.native_connection
         def observe():
@@ -102,7 +127,7 @@ def main():
             account['source']['credentials_file'] = str(account_home / 'auth.json')
             account['source']['profile_dir'] = str(account_home)
         native_id = next(a['id'] for a in config['accounts'] if a['source']['expected_subject'] == subject)
-        target_id = native_id if args.legacy_upgrade else next(a['id'] for a in config['accounts'] if a['id'] != native_id)
+        target_id = native_id if args.legacy_upgrade or args.control else next(a['id'] for a in config['accounts'] if a['id'] != native_id)
         target_label = next(a.get('label', a['id']) for a in config['accounts'] if a['id'] == target_id)
         ids = {a['id'] for a in config['accounts']}
         config['channels'] = [c for c in config['channels'] if c['account_id'] in ids]
@@ -113,13 +138,19 @@ def main():
         server = web.Server(('127.0.0.1', 0), console)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         atomic(root / 'runtime.json', {'port': server.server_port})
+        pool_model = 'gpt-6-astra' if args.control else 'gpt-6.1-sol'
         route = console.native.save_route({'name': 'hot-switch live QA', 'mode': 'fixed',
-            'allow_api': False, 'primary': [target_id + '-gpt-6.1-sol'], 'regular': []})
+            'allow_api': False, 'primary': [target_id + '-' + pool_model], 'regular': []})
         console.native.enable(route['id'])
         with patch('qp.desktop.install_startup'):
             api(root, '/api/desktop/connect' if args.legacy_upgrade else '/api/desktop/hot-connect', {})
-        report.update(cross_account=not args.legacy_upgrade, native_account=native_id, pool_account=target_id)
+        report.update(cross_account=target_id != native_id, native_account=native_id, pool_account=target_id)
         print(json.dumps({'root': str(root), 'cross_account': report['cross_account']}), flush=True)
+        def control_binary():
+            if not args.control:
+                return None
+            from qp.control import install
+            return install(console.native)['wrapper']
 
         def receipts(tid):
             sid = hashlib.sha256(tid.encode()).hexdigest()[:16]
@@ -159,7 +190,19 @@ def main():
             with patch('qp.desktop.remove_startup'), patch('qp.desktop.install_startup'):
                 api(root, '/api/desktop/restore', {})
                 api(root, '/api/desktop/hot-connect', {})
-            client = clients['legacy'] = Client(home=home)
+            if args.control_compact:
+                assert args.control, '--control-compact requires --control'
+                catalog = json.loads((home / 'models_cache.json').read_text())
+                for model in catalog['models']:
+                    if model['slug'] == pool_model:
+                        model['context_window'] = 32000
+                        model['max_context_window'] = 32000
+                atomic(home / 'compact-test-models.json', catalog)
+                with (home / 'config.toml').open('a') as config_file:
+                    config_file.write('\nmodel_catalog_json=' + json.dumps(str(home / 'compact-test-models.json')) + '\n')
+                report['compaction_test_window'] = 32000
+            client = clients['legacy'] = Client(home=home, binary=control_binary(),
+                overrides={'features.code_mode_host': True} if args.control else None)
             resumed = client.call('thread/resume', {'threadId': tid, 'excludeTurns': True})
             assert resumed['thread']['id'] == tid and resumed['modelProvider'] == 'openai'
             pids['legacy'] = client.p.pid
@@ -173,7 +216,8 @@ def main():
             assert hashlib.sha256((home / 'config.toml').read_bytes()).hexdigest() == config_hash
             first = key not in clients
             if first:
-                clients[key] = Client(home=home)
+                clients[key] = Client(home=home, binary=control_binary(),
+                    overrides={'features.code_mode_host': True} if args.control else None)
                 pids[key] = clients[key].p.pid
                 start = clients[key].call('thread/start', {'cwd': str(workspace), 'approvalPolicy': 'never',
                     'sandbox': 'read-only', 'ephemeral': False})
@@ -187,24 +231,45 @@ def main():
             else:
                 prompt = 'Reply with the exact HOT_SWITCH marker you read earlier. Do not use tools or add other words.'
             client, tid = clients[key], threads[key]
+            if args.control_compact and label == 'upgraded-next-turn-qpool':
+                filler = ' '.join('filler_%06d' % i for i in range(22000))
+                client.call('thread/inject_items', {'threadId': tid, 'items': [
+                    {'type': 'message', 'role': 'user', 'content': [
+                        {'type': 'input_text', 'text': 'Irrelevant test padding; retain the earlier HOT_SWITCH marker. ' + filler}]}]})
             before = len(receipts(tid))
-            response = client.turn(tid, prompt)
+            queued = args.control_queued and mode == 'qpool'
+            response = client.turn(tid, prompt, queued=queued)
             rows = receipts(tid)[before:]
             row = {'stage': label, 'mode': mode, 'thread_id': tid, 'engine_pid': client.p.pid,
                    'same_process': pids[key] == client.p.pid and client.p.poll() is None,
                    'same_thread': client.call('thread/read', {'threadId': tid, 'includeTurns': False})['thread']['id'] == tid,
                    'history_recalled': markers[key] in response['text'], 'item_types': response['item_types'],
-                   'receipts': rows, 'passed': False}
+                   'receipts': rows, 'queued': queued, 'passed': False}
             expected_mode = 'native' if mode == 'native' else None
-            row['passed'] = (row['same_process'] and row['same_thread'] and row['history_recalled'] and bool(rows)
-                and all(r['status'] == 'completed' and r['model'] == 'gpt-6.1-sol'
-                        and r['entry_mode'] == expected_mode for r in rows)
-                and (mode == 'native' or all(r['account'] == target_label for r in rows))
+            expected_model = 'gpt-6.1-sol' if mode == 'native' else pool_model
+            if args.control:
+                configured = client.call('thread/read', {'threadId': tid, 'includeTurns': False})['thread']['model']
+                row['codex_configured_model'] = configured
+                assert configured == expected_model, 'Codex did not adopt routed model'
+            execution_rows = rows
+            if args.control_compact and label == 'upgraded-next-turn-qpool':
+                assert rows[0]['entry_mode'] == 'native' and rows[0]['model'] == 'gpt-6.1-sol'
+                assert rows[0]['status'] == 'completed'
+                execution_rows = rows[1:]
+                row['pre_switch_compaction_used_previous_model'] = True
+            row['passed'] = (row['same_process'] and row['same_thread'] and row['history_recalled'] and bool(execution_rows)
+                and all(r['status'] == 'completed' and r['model'] == expected_model
+                        and r['entry_mode'] == expected_mode for r in execution_rows)
+                and (mode == 'native' or all(r['account'] == target_label for r in execution_rows))
                 and (not first or 'commandExecution' in row['item_types']))
             report['stages'].append(row)
             atomic(root / 'report.json', report)
             print(json.dumps(row, ensure_ascii=False), flush=True)
             assert row['passed'], 'production hot-switch verification failed'
+            if args.control_compact and label == 'upgraded-next-turn-qpool':
+                assert 'contextCompaction' in row['item_types'], 'expected actual model-switch compaction'
+            if queued:
+                assert not client.call('thread/queue/list', {'threadId': tid})['data'], 'queued input was not consumed'
 
         if args.legacy_upgrade:
             turn('legacy', 'native', 'upgraded-native')
@@ -222,6 +287,8 @@ def main():
             console.native.close(); console.manager.close()
         if observer:
             observer.stop()
+        if http_observer:
+            http_observer.stop()
         report['original_files_unchanged'] = all(hashlib.sha256(path.read_bytes()).hexdigest() == value
                                                for path, value in originals.items())
         for path in [home / 'auth.json', *root.glob('accounts/*/auth.json'),

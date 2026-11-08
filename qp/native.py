@@ -236,6 +236,20 @@ class Native:
             conn.execute('''CREATE TABLE IF NOT EXISTS desktop_turns
                 (session TEXT PRIMARY KEY, turn TEXT NOT NULL, mode TEXT NOT NULL,
                  model TEXT NOT NULL, subject TEXT NOT NULL)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS control_plans
+                (token TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,
+                 detail TEXT NOT NULL, created REAL NOT NULL)''')
+            conn.execute('CREATE INDEX IF NOT EXISTS control_plans_session ON control_plans(session, created DESC)')
+            conn.execute('''CREATE TABLE IF NOT EXISTS control_queue
+                (session TEXT NOT NULL, queued_id TEXT NOT NULL, subject TEXT NOT NULL,
+                 result TEXT, PRIMARY KEY(session, queued_id))''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS control_previous
+                (session TEXT PRIMARY KEY, turn TEXT, subject TEXT NOT NULL, detail TEXT NOT NULL)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS control_preferences
+                (session TEXT PRIMARY KEY, subject TEXT NOT NULL, model TEXT NOT NULL,
+                 effort TEXT, actual_model TEXT)''')
+            if 'actual_effort' not in {r['name'] for r in conn.execute('PRAGMA table_info(control_preferences)')}:
+                conn.execute('ALTER TABLE control_preferences ADD COLUMN actual_effort TEXT')
             conn.execute('''CREATE TABLE IF NOT EXISTS decisions
                 (id TEXT PRIMARY KEY, created REAL, route TEXT, session TEXT, scope TEXT, detail TEXT)''')
             conn.execute('CREATE INDEX IF NOT EXISTS requests_session ON requests(session)')

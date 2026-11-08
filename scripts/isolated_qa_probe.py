@@ -17,8 +17,8 @@ def api(root,path,data=None,timeout=90):
 
 
 class Client:
-    def __init__(self,home=None,proxy=False,overrides=None):
-        command=[BINARY]+([] if proxy else ['--no-daemon'])+['app-server']
+    def __init__(self,home=None,proxy=False,overrides=None,binary=None):
+        command=[str(binary or BINARY)]+([] if proxy else ['--no-daemon'])+['app-server']
         command+=['proxy'] if proxy else ['--listen','stdio://']
         def toml(value):
             if isinstance(value,dict):return '{'+','.join(json.dumps(k)+'='+toml(v) for k,v in value.items())+'}'
@@ -53,8 +53,14 @@ class Client:
             if d.get('id')==ident:
                 if 'error' in d:raise RuntimeError(str(d['error']))
                 return d['result']
-    def turn(self,thread,prompt):
-        self.call('turn/start',{'threadId':thread,'input':[{'type':'text','text':prompt}]})
+    def turn(self,thread,prompt,queued=False):
+        params={'threadId':thread,'input':[{'type':'text','text':prompt}]}
+        if queued:
+            import uuid
+            item=self.call('thread/queue/add',dict(params,clientUserMessageId=str(uuid.uuid4())))['queuedSubmission']
+            self.call('thread/queue/start',{'threadId':thread,'queuedSubmissionId':item['id']})
+        else:
+            self.call('turn/start',params)
         text='';items=[]
         until=time.monotonic()+180
         while time.monotonic()<until:
