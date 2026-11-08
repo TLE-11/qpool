@@ -318,13 +318,41 @@ class Proxy:
                 worker.join(timeout=1)
 
 
+def is_rpc_server(args):
+    # Skip option values before identifying the command: a snapshot file named
+    # "proxy" is not the app-server proxy subcommand. Native Codex still owns
+    # validation of the options themselves.
+    valued = {'-c', '--config', '--enable', '--disable', '-p', '--profile',
+              '--startup-client-info', '--cloud-skills-snapshot', '--code-mode-host',
+              '--listen', '--ws-auth', '--ws-token-file', '--ws-token-sha256',
+              '--ws-shared-secret-file', '--ws-issuer', '--ws-audience',
+              '--ws-max-clock-skew-seconds'}
+    server = False
+    tokens = iter(args)
+    for arg in tokens:
+        if arg in valued:
+            next(tokens, None)
+        elif arg in ('--help', '-h', '--version', '-V', '--print-startup-config'):
+            return False
+        elif arg.startswith('-'):
+            continue
+        elif not server and arg == 'app-server':
+            server = True
+        else:
+            return False  # Other commands and all app-server subcommands.
+    return server
+
+
 def main(root, binary):
     args = sys.argv[1:]
     # The desktop locates this shim through CODEX_CLI_PATH; the real engine and
     # its runtime helpers must resolve the bundled binary, never recurse here.
     os.environ['CODEX_CLI_PATH'] = binary
     os.environ['CODEX_APP_RUNTIME_CLI_PATH'] = binary
-    if 'app-server' not in args or any(v in args for v in ('--help', '-h', 'generate-ts', 'generate-json-schema')):
+    # Desktop policy bootstrap is a one-shot CLI invocation with stdin closed,
+    # not a JSON-RPC session. Its JSON output and exit status must pass through
+    # untouched; terminating it on stdin EOF prevents the desktop from starting.
+    if not is_rpc_server(args):
         os.execv(binary, [binary] + args)
     if not desktop.read_state(root):
         os.execv(binary, [binary] + args)  # Explicit restore returns to the native entry.

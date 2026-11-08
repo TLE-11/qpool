@@ -355,6 +355,96 @@
           "codex_configured_model": "gpt-6.1-sol"
         }
       ]
+    },
+    "desktop_manual": {
+      "stages": [
+        {
+          "mode": "native",
+          "thread_id": "01a1bb3a-e892-7401-920b-9c4025bcbf2a",
+          "user_reported_model": "gpt-6.1-sol",
+          "history_recalled": true,
+          "receipts": [
+            {
+              "status": "completed",
+              "model": "gpt-6.1-sol",
+              "actual_model": "gpt-6.1-sol",
+              "entry_mode": "native",
+              "started": 1794143621.752148
+            }
+          ],
+          "app_pid": 69424,
+          "wrapper_pid": 69717,
+          "engine_pid": 69720
+        },
+        {
+          "mode": "qpool",
+          "thread_id": "01a1bb3a-e892-7401-920b-9c4025bcbf2a",
+          "user_reported_model": "gpt-6.1-sol",
+          "history_recalled": true,
+          "receipts": [
+            {
+              "status": "completed",
+              "model": "gpt-6-astra",
+              "actual_model": "gpt-6-astra",
+              "entry_mode": null,
+              "started": 1794143736.870523
+            }
+          ],
+          "app_pid": 69424,
+          "wrapper_pid": 69717,
+          "engine_pid": 69720
+        },
+        {
+          "mode": "native",
+          "thread_id": "01a1bb3a-e892-7401-920b-9c4025bcbf2a",
+          "user_reported_model": "gpt-6.1-sol",
+          "history_recalled": true,
+          "receipts": [
+            {
+              "status": "completed",
+              "model": "gpt-6.1-sol",
+              "actual_model": "gpt-6.1-sol",
+              "entry_mode": "native",
+              "started": 1794143794.517869
+            }
+          ],
+          "app_pid": 69424,
+          "wrapper_pid": 69717,
+          "engine_pid": 69720
+        }
+      ],
+      "startup_checks": [
+        {
+          "scenario": "--print-startup-config",
+          "wrapper_exit": 0,
+          "native_exit": 0,
+          "stdout_equal": true,
+          "nonempty": true
+        },
+        {
+          "scenario": "help",
+          "wrapper_exit": 0,
+          "native_exit": 0,
+          "stdout_equal": true,
+          "nonempty": true
+        }
+      ],
+      "user_confirmed_startup": true,
+      "same_process": true,
+      "same_thread": true,
+      "actual_routing_verified": true,
+      "original_files_unchanged": true,
+      "test_credentials_removed": 3,
+      "test_processes_stopped": true,
+      "full_suite": {
+        "tests": 266,
+        "seconds": 140.569,
+        "passed": true
+      },
+      "interaction": "User sent prompts and reported displayed model; local receipt and process checks performed by agent."
     }
-  }
+  },
+  "gui_startup_verified": true,
+  "gui_actual_routing_verified": true,
+  "gui_model_display_verified": false
 }

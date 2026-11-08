@@ -181,6 +181,32 @@ class ControlTests(unittest.TestCase):
 
 
 class ProxyTests(unittest.TestCase):
+    def test_desktop_policy_bootstrap_executes_native_without_proxy(self):
+        from qp.control_proxy import main
+        args = ['codex-control', '-c', 'features.code_mode_host=true', 'app-server',
+                '--print-startup-config', '--startup-client-info', '{"name":"codex_desktop"}']
+        with patch('sys.argv', args), patch.dict(os.environ), \
+                patch('qp.control_proxy.os.execv', side_effect=SystemExit(0)) as execute, \
+                patch('qp.control_proxy.desktop.token') as token, \
+                patch('qp.control_proxy.subprocess.Popen') as spawn:
+            with self.assertRaises(SystemExit):
+                main('/unused/root', '/real/codex')
+        execute.assert_called_once_with('/real/codex', ['/real/codex'] + args[1:])
+        token.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_only_rpc_server_invocations_are_intercepted(self):
+        from qp.control_proxy import is_rpc_server
+        for command in ('help', 'daemon', 'proxy', 'generate-ts', 'generate-json-schema'):
+            with self.subTest(command=command):
+                self.assertFalse(is_rpc_server(['app-server', command]))
+        for value in ('proxy', 'daemon', 'app-server', '--print-startup-config'):
+            with self.subTest(snapshot=value):
+                self.assertTrue(is_rpc_server(['-c', 'features.code_mode_host=true',
+                    'app-server', '--cloud-skills-snapshot', value, '--listen=stdio://']))
+        self.assertTrue(is_rpc_server(['app-server', '--analytics-default-enabled']))
+        self.assertFalse(is_rpc_server(['--config', 'app-server', 'login', 'status']))
+
     def proxy(self, active=False):
         p = Proxy(None, '/tmp/unused')
         def rpc(method, params):
