@@ -1028,6 +1028,239 @@
       "original_files_unchanged": true,
       "test_processes_stopped": true,
       "credential_copies_removed": 5
+    },
+    "p2_fixes_live": {
+      "cross_account": false,
+      "legacy_creation": {
+        "thread_id": "01a1bb82-173d-7622-bf00-c09442f72d8b",
+        "engine_pid": 419,
+        "history_recalled": true,
+        "item_types": [
+          "userMessage",
+          "agentMessage",
+          "commandExecution",
+          "agentMessage"
+        ],
+        "legacy_binding_verified": true,
+        "receipts": [
+          {
+            "status": "completed",
+            "model": "gpt-6.1-sol",
+            "actual_model": "gpt-6.1-sol",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          },
+          {
+            "status": "completed",
+            "model": "gpt-6.1-sol",
+            "actual_model": "gpt-6.1-sol",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          }
+        ]
+      },
+      "upgrade": {
+        "initial_reload": true,
+        "resumed_same_thread": true,
+        "engine_pid_after_upgrade": 3147
+      },
+      "stages": [
+        {
+          "stage": "upgraded-native",
+          "mode": "native",
+          "thread_id": "01a1bb82-173d-7622-bf00-c09442f72d8b",
+          "engine_pid": 3147,
+          "same_process": true,
+          "same_thread": true,
+          "history_recalled": true,
+          "item_types": [
+            "userMessage",
+            "agentMessage"
+          ],
+          "receipts": [
+            {
+              "status": "completed",
+              "model": "gpt-6.1-sol",
+              "actual_model": "gpt-6.1-sol",
+              "account": "native-login",
+              "entry_mode": "native"
+            }
+          ],
+          "queued": false,
+          "passed": true,
+          "codex_configured_model": "gpt-6.1-sol",
+          "settings_notifications": []
+        },
+        {
+          "stage": "upgraded-next-turn-qpool",
+          "mode": "qpool",
+          "thread_id": "01a1bb82-173d-7622-bf00-c09442f72d8b",
+          "engine_pid": 3147,
+          "same_process": true,
+          "same_thread": true,
+          "history_recalled": true,
+          "item_types": [
+            "userMessage",
+            "agentMessage"
+          ],
+          "receipts": [
+            {
+              "status": "completed",
+              "model": "gpt-6-astra",
+              "actual_model": "gpt-6-astra",
+              "account": "same-subscription-pool",
+              "entry_mode": null
+            }
+          ],
+          "queued": true,
+          "passed": true,
+          "codex_configured_model": "gpt-6-astra",
+          "settings_notifications": [
+            {
+              "model": "gpt-6-astra",
+              "effort": "low"
+            },
+            {
+              "model": "gpt-6-astra",
+              "effort": "low"
+            }
+          ]
+        },
+        {
+          "stage": "upgraded-next-turn-native",
+          "mode": "native",
+          "thread_id": "01a1bb82-173d-7622-bf00-c09442f72d8b",
+          "engine_pid": 3147,
+          "same_process": true,
+          "same_thread": true,
+          "history_recalled": true,
+          "item_types": [
+            "userMessage",
+            "agentMessage"
+          ],
+          "receipts": [
+            {
+              "status": "completed",
+              "model": "gpt-6.1-sol",
+              "actual_model": "gpt-6.1-sol",
+              "account": "native-login",
+              "entry_mode": "native"
+            }
+          ],
+          "queued": false,
+          "passed": true,
+          "codex_configured_model": "gpt-6.1-sol",
+          "settings_notifications": [
+            {
+              "model": "gpt-6.1-sol",
+              "effort": "low"
+            },
+            {
+              "model": "gpt-6.1-sol",
+              "effort": "low"
+            }
+          ]
+        }
+      ],
+      "queued_while_busy": {
+        "passed": true,
+        "thread_id": "01a1bb82-173d-7622-bf00-c09442f72d8b",
+        "engine_pid": 3147,
+        "ordered_suffixes": [
+          "QUEUE_GATE",
+          "QUEUE_B",
+          "QUEUE_EDITED"
+        ],
+        "deleted_not_run": true,
+        "mode_changed_while_waiting": true,
+        "turn_ids": [
+          "01a1bb82-b874-78d2-a536-703dbe2da70a",
+          "01a1bb83-2750-7593-8f4f-8b9bc0cb3942",
+          "01a1bb83-4dca-77c3-9f2d-7ab6ba7bfe85"
+        ],
+        "item_types": [
+          [
+            "userMessage",
+            "agentMessage",
+            "commandExecution",
+            "agentMessage"
+          ],
+          [
+            "userMessage",
+            "agentMessage"
+          ],
+          [
+            "userMessage",
+            "agentMessage"
+          ]
+        ],
+        "receipts": [
+          {
+            "status": "completed",
+            "model": "gpt-6.1-sol",
+            "actual_model": "gpt-6.1-sol",
+            "account": "native-login",
+            "entry_mode": "native"
+          },
+          {
+            "status": "completed",
+            "model": "gpt-6.1-sol",
+            "actual_model": "gpt-6.1-sol",
+            "account": "native-login",
+            "entry_mode": "native"
+          },
+          {
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "actual_model": "gpt-6-astra",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          },
+          {
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "actual_model": "gpt-6-astra",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          }
+        ]
+      },
+      "in_place_publish": {
+        "passed": true,
+        "thread_id": "01a1bb82-173d-7622-bf00-c09442f72d8b",
+        "engine_pid": 3147,
+        "published_during_tool": true,
+        "grant_unchanged": true,
+        "current_turn_model": "gpt-6-astra",
+        "next_turn_model": "gpt-6.1-sol",
+        "current_turn_receipts": [
+          {
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "actual_model": "gpt-6-astra",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          },
+          {
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "actual_model": "gpt-6-astra",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          }
+        ],
+        "next_turn_receipts": [
+          {
+            "status": "completed",
+            "model": "gpt-6.1-sol",
+            "actual_model": "gpt-6.1-sol",
+            "account": "same-subscription-pool",
+            "entry_mode": null
+          }
+        ]
+      },
+      "original_files_unchanged": true,
+      "config_unchanged_during_switches": true
     }
   },
   "gui_startup_verified": true,
@@ -1035,8 +1268,8 @@
   "gui_model_display_verified": true,
   "queued_ui_manually_verified": false,
   "full_suite": {
-    "tests": 276,
-    "seconds": 143.22,
+    "tests": 281,
+    "seconds": 139.83,
     "passed": true
   },
   "failed_verification_attempts": [
@@ -1048,5 +1281,17 @@
       "stage": "combined busy queue and 32k context window",
       "cause": "Fixed HTTP request-count assumption rejected valid repeated contextCompaction. Replaced with per-turn identity, ordered outputs, model boundary, completed status and observed compaction assertions; fresh final run passed."
     }
-  ]
+  ],
+  "p2_regressions": {
+    "target": "main..72e7002",
+    "before_fix_targeted_failures": 4,
+    "fixed": [
+      "in_place_publish_continuation",
+      "busy_after_selection_and_before_submit",
+      "classification_truncation_completeness"
+    ],
+    "deferred_native_preference_regression": true,
+    "independent_review": "No further reproducible findings",
+    "gui_visual_evidence": "Reused prior user-confirmed run; no GUI opened in this revision."
+  }
 }

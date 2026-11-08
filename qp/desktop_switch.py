@@ -233,6 +233,7 @@ def handle(handler, path):
                 return gateway.handle(handler, path.replace(PREFIX, '/v1', 1),
                     switch_body=dict(body, model='qpool-auto'), switch_model=model,
                     switch_binding=plan['binding'], switch_grant=plan['grant'], switch_route=plan['route'],
+                    switch_route_pinned=plan['route_pinned'],
                     switch_legacy_account=old_account)
             # Approval calls are owned by the native login and must never enter
             # automatic model/account selection or overwrite the user's turn pin.

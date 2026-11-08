@@ -80,6 +80,54 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(502, self.request(body)[0])
         self.assertEqual([], self.requests)
 
+    def test_in_place_publish_keeps_started_turn_binding_but_rejects_unstarted_plan(self):
+        from qp.native import digest
+        started = self.prepare()
+        stale = self.prepare()
+        body = self.controlled(started)
+        self.assertEqual(200, self.request(body)[0])
+        # Publication waits for HTTP requests, but a tool can run between them.
+        with self.native.turn_lock(('request', digest('native-session')[:16])):
+            pass
+        grant = self.native.grant
+        self.native.save_route(dict(self.route, mode='fixed', regular=[], primary=[self.large], apply_to_active=True))
+        self.assertEqual(grant, self.native.grant)
+        continued = copy.deepcopy(body)
+        continued['input'].append({'type': 'function_call_output', 'call_id': 'tool-1', 'output': 'ok'})
+        self.assertEqual(200, self.request(continued)[0])
+        self.assertEqual('gpt-test-small', self.requests[-1][1]['model'])
+        self.assertEqual(200, self.request(copy.deepcopy(body), path='/switch/v1/responses/compact')[0])
+        self.assertEqual(502, self.request(self.controlled(stale))[0])
+        wrong_turn = copy.deepcopy(body)
+        wrong_turn['client_metadata']['turn_id'] = str(uuid.uuid4())
+        self.assertEqual(502, self.request(wrong_turn)[0])
+        next_plan = self.prepare()
+        self.assertEqual('gpt-test-large', next_plan['model'])
+        previous_compact = self.controlled(next_plan)
+        previous_compact['model'] = 'gpt-test-small'
+        self.assertEqual(200, self.request(previous_compact, path='/switch/v1/responses/compact')[0])
+        self.assertEqual('gpt-test-small', self.requests[-1][1]['model'])
+        self.assertEqual(200, self.request(self.controlled(next_plan))[0])
+        self.native.disable()
+        self.native.enable(self.route['id'])
+        self.assertNotEqual(grant, self.native.grant)
+        self.assertEqual(502, self.request(continued)[0])
+
+    def test_deferred_plan_does_not_turn_unchanged_engine_into_new_native_preference(self):
+        pool = self.prepare()  # Native large/high preference, pool small/medium.
+        self.assertEqual('gpt-test-small', pool['model'])
+        self.mode('native')
+        snapshot = {'model': 'gpt-test-small', 'effort': 'medium',
+                    'currentModel': 'gpt-test-small', 'currentEffort': 'medium'}
+        first = self.prepare(**snapshot)
+        self.assertEqual('gpt-test-large', first['model'])
+        # Queue defers without applying settings: the engine remains unchanged.
+        retry = self.prepare(**snapshot)
+        self.assertEqual('gpt-test-large', retry['model'])
+        with self.native.receipts() as db:
+            pref = db.execute('SELECT model,effort FROM control_preferences').fetchone()
+        self.assertEqual(('gpt-test-large', 'high'), tuple(pref))
+
     def test_preference_change_survives_pool_execution(self):
         self.prepare()
         self.prepare(model='gpt-test-small', explicit=True, preferenceOnly=True)
@@ -383,6 +431,58 @@ class ProxyTests(unittest.TestCase):
         self.assertIsNone(proxy.start_queued(params, automatic=True))
         self.assertNotIn('turn/start', calls)
         self.assertIsNotNone(store.operate('peek', params))
+
+    def test_queue_becoming_active_during_selection_does_not_update_settings_or_submit(self):
+        proxy, store, params = self.queued_proxy()
+        busy = False
+        calls = []
+        def rpc(method, data):
+            calls.append(method)
+            if method == 'thread/read':
+                return {'thread': {'modelProvider': 'openai', 'model': 'sol',
+                    'reasoningEffort': 'high', 'status': {'type': 'active' if busy else 'idle'}}}
+            return {'data': []}
+        def selection(*args):
+            nonlocal busy
+            busy = True
+            return {'token': 'plan', 'model': 'astra', 'effort': 'low'}
+        proxy.rpc = rpc
+        with patch('qp.control_proxy.api', side_effect=selection):
+            self.assertIsNone(proxy.start_queued(params, automatic=True))
+        self.assertNotIn('thread/settings/update', calls)
+        self.assertNotIn('turn/start', calls)
+        self.assertIsNotNone(store.operate('peek', params))
+
+    def test_queue_becoming_active_after_settings_does_not_submit(self):
+        proxy, store, params = self.queued_proxy()
+        def prepared(data, **kwargs):
+            proxy.active_turns['t'] = 'outside-turn'
+            return dict(data, model='astra')
+        proxy.prepare_turn = prepared
+        with patch.object(proxy, 'rpc', return_value={'data': []}) as rpc, \
+                patch.object(proxy, 'idle_for_queue', side_effect=lambda _: not proxy.active_turns):
+            self.assertIsNone(proxy.start_queued(params, automatic=True))
+        rpc.assert_not_called()
+        self.assertIsNotNone(store.operate('peek', params))
+
+    def test_all_classification_truncation_is_marked_partial(self):
+        from qp.decisions import context
+        inputs = [{'type': 'text', 'text': 'x' * 9000} for _ in range(3)]
+        original = copy.deepcopy(inputs)
+        items = decision_items([], inputs)
+        text = '\n'.join(p['text'] for p in items[-1]['content'] if p.get('type') == 'input_text')
+        projected = context(text, items)
+        self.assertTrue(projected['history_partial'])
+        self.assertTrue(any(p['kind'] == 'unavailable' for p in projected['latest_user']))
+        self.assertLessEqual(len(json.dumps(items[-1], ensure_ascii=False).encode()), 12000)
+        self.assertEqual(original, inputs)
+        # Dropping tiny blocks and shortening assistant history need the same signal.
+        items = decision_items([], [{'type': 'text', 'text': 'x'} for _ in range(1000)])
+        self.assertTrue(context('x', items)['history_partial'])
+        items = decision_items([{'items': [{'type': 'agentMessage', 'text': 'a' * 9000}]}],
+                               [{'type': 'text', 'text': 'continue'}])
+        self.assertTrue(context('continue', items)['history_partial'])
+        self.assertFalse(context('hello', decision_items([], [{'type': 'text', 'text': 'hello'}]))['history_partial'])
 
     def test_invalid_crud_does_not_change_queue_head(self):
         proxy, store, params = self.queued_proxy()

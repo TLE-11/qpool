@@ -13,7 +13,8 @@ from .collectors.base import CollectorError
 
 
 def handle(handler, path, *, switch_body=None, switch_model=None, switch_turn=None, switch_compact=False,
-           switch_legacy_account=None, switch_binding=None, switch_grant=None, switch_route=None):
+           switch_legacy_account=None, switch_binding=None, switch_grant=None, switch_route=None,
+           switch_route_pinned=False):
     native = handler.server.console.native
     authorization = handler.headers.get('Authorization', '')
     grant = native.grant
@@ -82,8 +83,8 @@ def handle(handler, path, *, switch_body=None, switch_model=None, switch_turn=No
         if not approval and not legacy and body.get('model') != 'qpool-auto' and not (path.endswith('/compact') and 'model' not in body):
             raise CollectorError('当前 qpool 会话请选择 qpool auto；原模型请在 OpenAI 会话中使用')
         if switch_binding is not None:
-            if digest(grant or '') != switch_grant or native.active != switch_route:
-                raise CollectorError('控制计划准备后路由已变化，请重新提问')
+            from .control import validate_plan_route
+            validate_plan_route(native, switch_grant, switch_route, pinned=switch_route_pinned)
             binding, session = switch_binding, digest(raw_session)[:16]
         elif approval:
             binding, session = native.approval_binding(body, handler.headers, approval_account)

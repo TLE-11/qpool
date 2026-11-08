@@ -65,12 +65,13 @@ class Client:
             self.call('turn/start',params)
         return self.wait_turn(thread)
 
-    def wait_turn(self,thread):
+    def wait_turn(self,thread,on_event=None):
         text='';items=[];settings=[]
         until=time.monotonic()+180
         while time.monotonic()<until:
             d=self.events.get(timeout=max(.1,until-time.monotonic()))
             if d.get('params',{}).get('threadId') not in (None,thread):continue
+            if on_event:on_event(d)
             if d.get('method')=='warning' and d['params'].get('message','').startswith('qpool 排队已暂停'):
                 raise RuntimeError(d['params']['message'])
             if d.get('method')=='item/agentMessage/delta':text+=d['params']['delta']

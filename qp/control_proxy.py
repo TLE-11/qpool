@@ -67,6 +67,8 @@ def user_item(inputs):
         elif item.get('type') in ('image', 'localImage'):
             # Classification sees only that non-text context exists, not image data.
             content.append({'type': 'input_image', 'image_url': '[image supplied to Codex]'})
+        else:
+            content.append({'type': 'unavailable', 'source_kind': 'omitted_input'})
     return {'role': 'user', 'content': content}
 
 
@@ -77,24 +79,32 @@ def decision_items(turns, inputs):
             if item.get('type') == 'userMessage':
                 items.append(user_item(item.get('content', [])))
             elif item.get('type') == 'agentMessage':
-                items.append({'role': 'assistant', 'content': item.get('text', '')[:6000]})
+                text = item.get('text', '')
+                content = [{'type': 'output_text', 'text': text[:6000]}]
+                if len(text) > 6000:
+                    content.append({'type': 'unavailable', 'source_kind': 'truncated_text'})
+                items.append({'role': 'assistant', 'content': content})
     # This is a bounded classification view, never the model's actual history.
     if turns:
-        items.insert(0, {'role': 'assistant', 'content': '[Earlier history omitted from routing view]'})
+        items.insert(0, {'role': 'assistant', 'content': [
+            {'type': 'unavailable', 'source_kind': 'omitted_history'}]})
     while len(json.dumps(items).encode()) > 48000:
         items.pop(1 if len(items) > 1 else 0)
     items.append(user_item(inputs))
-    while len(json.dumps(items, ensure_ascii=False).encode()) > 80000 and len(items) > 1:
-        items.pop(0)
+    while len(json.dumps(items, ensure_ascii=False).encode()) > 80000 and len(items) > 2:
+        items.pop(1)  # Preserve the omitted-history signal and latest input.
     # Multiple pasted text blocks can exceed the classifier budget as well.
     while len(json.dumps(items[-1], ensure_ascii=False).encode()) > 12000:
+        marker = {'type': 'unavailable', 'source_kind': 'truncated_text'}
+        if marker not in items[-1]['content']:
+            items[-1]['content'].append(marker)
         texts = [p for p in items[-1]['content'] if p.get('type') == 'input_text']
         if not texts:
-            items[-1]['content'] = items[-1]['content'][:1]
+            items[-1]['content'] = items[-1]['content'][:1] + [marker]
             break
         longest = max(texts, key=lambda p: len(p['text']))
         if len(longest['text']) < 2:
-            items[-1]['content'] = items[-1]['content'][:1]
+            items[-1]['content'] = items[-1]['content'][:1] + [marker]
             break
         longest['text'] = longest['text'][:len(longest['text']) // 2]
     return items
@@ -223,9 +233,12 @@ class Proxy:
         settings = (params.get('collaborationMode') or {}).get('settings', {})
         plan = api(self.root, 'prepare', {'threadId': thread,
                    'currentModel': snapshot.get('model'),
+                   'currentEffort': snapshot.get('reasoningEffort'),
                    'model': settings.get('model') or params.get('model') or snapshot.get('model'),
                    'effort': settings.get('reasoning_effort') or params.get('effort') or snapshot.get('reasoningEffort'),
                    'items': decision_items(turns, params['input'])})
+        if require_idle and not self.idle_for_queue(thread):
+            raise QueueBusy('选模期间已有回复开始，排队消息继续等待')
         params = copy.deepcopy(params)
         params.update(model=plan['model'], effort=plan['effort'])
         if params.get('collaborationMode'):
@@ -260,11 +273,15 @@ class Proxy:
             return (thread not in self.active_turns and not native_queue['data'] and
                     snapshot.get('status', {}).get('type') == 'idle')
 
-    def submit_turn(self, params):
+    def submit_turn(self, params, require_idle=False):
         thread = params['threadId']
+        if require_idle and not self.idle_for_queue(thread):
+            raise QueueBusy('提交前已有回复开始，排队消息继续等待')
         # Acceptance can precede thread/status/changed. Close that interval so
         # a queued follow-up cannot accidentally become active-turn steering.
         with self.pending_lock:
+            if require_idle and thread in self.active_turns:
+                raise QueueBusy('提交前已有回复开始，排队消息继续等待')
             self.active_turns.setdefault(thread, 'pending')
         try:
             return self.rpc('turn/start', params)
@@ -307,7 +324,12 @@ class Proxy:
             store.operate('rejected', params)
             raise
         try:
-            result = self.submit_turn(prepared)
+            result = self.submit_turn(prepared, require_idle=True)
+        except QueueBusy:
+            store.operate('deferred', params)
+            if automatic:
+                return None
+            raise
         except RpcError:
             store.operate('rejected', params)
             raise

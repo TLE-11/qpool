@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--control-compact', action='store_true',
                         help='Force small-window model compaction with an isolated 32k catalog and injected filler.')
     parser.add_argument('--control-queued', action='store_true', help='Use the desktop queued-followup protocol for pool turns.')
+    parser.add_argument('--control-publish', action='store_true', help='Publish a new route while a real tool is running.')
     args = parser.parse_args()
     from qp.native import atomic
     from qp import web, desktop_switch
@@ -325,6 +326,48 @@ def main():
                 'mode_changed_while_waiting': True, 'turn_ids': [r['turn_id'] for r in responses],
                 'item_types': [r['item_types'] for r in responses], 'receipts': rows}
             print(json.dumps(report['queued_while_busy'], ensure_ascii=False), flush=True)
+        if args.control_publish:
+            assert args.control, '--control-publish requires --control'
+            key = 'legacy' if args.legacy_upgrade else 'native'
+            client, tid = clients[key], threads[key]
+            api(root, '/api/desktop/mode', {'mode': 'qpool'})
+            before = len(receipts(tid))
+            old_grant = console.native.grant
+            published = []
+            def publish(event):
+                item = event.get('params', {}).get('item', {})
+                if published or event.get('method') != 'item/started' or item.get('type') != 'commandExecution':
+                    return
+                until = time.monotonic() + 3
+                while True:
+                    with console.native.selection_lock:
+                        running = any(k[0] == 'request' for k in console.native.turn_locks)
+                    if not running:
+                        break
+                    assert time.monotonic() < until, 'model HTTP stream did not finish before tool publication'
+                    time.sleep(.02)
+                changed = dict(console.native.active, mode='fixed', regular=[],
+                               primary=[target_id + '-gpt-6.1-sol'])
+                api(root, '/api/routes/apply', changed)
+                assert console.native.grant == old_grant
+                published.append(True)
+            client.call('turn/start', {'threadId': tid, 'input': [{'type': 'text', 'text':
+                'Use a terminal tool to run python3 -c "import time; time.sleep(8); print(123)". '
+                'After it completes, reply only with the exact HOT_SWITCH marker you read earlier. Do not modify files.'}]})
+            result = client.wait_turn(tid, on_event=publish)
+            rows = receipts(tid)[before:]
+            assert published and 'commandExecution' in result['item_types'] and markers[key] in result['text']
+            assert len(rows) >= 2 and all(r['status'] == 'completed' and r['actual_model'] == pool_model for r in rows)
+            before_next = len(receipts(tid))
+            following = client.turn(tid, 'Reply only with the exact HOT_SWITCH marker you read earlier. No tools.')
+            next_rows = receipts(tid)[before_next:]
+            assert markers[key] in following['text'] and next_rows
+            assert all(r['status'] == 'completed' and r['actual_model'] == 'gpt-6.1-sol' for r in next_rows)
+            report['in_place_publish'] = {'passed': True, 'thread_id': tid, 'engine_pid': client.p.pid,
+                'published_during_tool': True, 'grant_unchanged': True,
+                'current_turn_model': pool_model, 'next_turn_model': 'gpt-6.1-sol',
+                'current_turn_receipts': rows, 'next_turn_receipts': next_rows}
+            print(json.dumps(report['in_place_publish'], ensure_ascii=False), flush=True)
         report['config_unchanged_during_switches'] = hashlib.sha256((home / 'config.toml').read_bytes()).hexdigest() == config_hash
     finally:
         for client in clients.values():

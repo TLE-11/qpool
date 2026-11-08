@@ -17,6 +17,16 @@ from .native import atomic, digest
 METADATA_KEY = 'qpool_control_plan'
 
 
+def validate_plan_route(native, grant, route, *, pinned=False):
+    # In-place publication keeps the grant and route identity. A turn already
+    # bound to its plan must finish tools/compaction on that immutable binding.
+    # Unstarted plans still require the exact revision; revocation always wins.
+    if (grant != digest(native.grant or '') or not native.grant or not native.active or
+            (route != native.active and not (pinned and isinstance(route, dict) and
+                                             route.get('id') == native.active.get('id')))):
+        raise CollectorError('准备后路由已变化，请重新提问')
+
+
 def previous_execution(native, sid, subject, model):
     """Snapshot before selection can replace the persisted execution binding."""
     with native.receipts() as db:
@@ -76,11 +86,14 @@ def prepare(native, data, headers):
         selected = data.get('model')
         model = pref['model'] if pref else selected or data.get('currentModel')
         effort = pref['effort'] if pref else data.get('effort')
-        # Desktop sends the last execution model on turn/start. Only a distinct
-        # picker choice (or explicit settings/update) changes the native choice.
-        if selected and (not pref or selected != pref['actual_model'] or data.get('explicit')):
+        # Preparation can be deferred before settings are applied. The engine
+        # snapshot, when supplied, is authoritative over the last planned model;
+        # otherwise a retry can mistake the unchanged engine for a new choice.
+        current_model = data.get('currentModel') or (pref['actual_model'] if pref else None)
+        current_effort = data.get('currentEffort') or (pref['actual_effort'] if pref else None)
+        if selected and (not pref or selected != current_model or data.get('explicit')):
             model, effort = selected, data.get('effort')
-        if data.get('effortExplicit') or (pref and data.get('effort') and data['effort'] != pref['actual_effort']):
+        if data.get('effortExplicit') or (pref and data.get('effort') and data['effort'] != current_effort):
             effort = data.get('effort')
         native_effort = effort
         known = native.model_metadata()
@@ -156,8 +169,9 @@ def resolve(native, body, headers, session, subject, compact=False):
             previous = plan.get('previous')
             if previous and body.get('model') == previous['model']:
                 execution = previous
-        if execution['mode'] == 'qpool' and (execution['grant'] != digest(native.grant or '') or execution['route'] != native.active):
-            raise CollectorError('准备后路由已变化，请重新提问')
+        pinned = bool(execution.get('turn'))
+        if execution['mode'] == 'qpool':
+            validate_plan_route(native, execution['grant'], execution['route'], pinned=pinned)
         if body.get('model', execution['model']) != execution['model']:
             raise CollectorError('Codex 实际模型与控制代理计划不一致')
         if not compact:
@@ -171,7 +185,7 @@ def resolve(native, body, headers, session, subject, compact=False):
     if encoded and metadata.get('x-codex-turn-metadata'):
         detail.pop(METADATA_KEY, None)
         body['client_metadata'] = dict(metadata, **{'x-codex-turn-metadata': json.dumps(detail)})
-    return execution
+    return dict(execution, route_pinned=pinned)
 
 
 def queue_claim(native, data, headers):
