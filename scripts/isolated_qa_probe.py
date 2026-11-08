@@ -28,10 +28,12 @@ class Client:
         env=dict(os.environ)
         if home:env['CODEX_HOME']=str(home)
         self.p=subprocess.Popen(command,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-        self.events=queue.Queue();self.ident=0
+        self.events=queue.Queue();self.responses=queue.Queue();self.ident=0
         def read():
             for line in self.p.stdout:
-                try:self.events.put(json.loads(line))
+                try:
+                    value=json.loads(line)
+                    (self.responses if 'id' in value and 'method' not in value else self.events).put(value)
                 except ValueError:pass
         threading.Thread(target=read,daemon=True).start()
         try:
@@ -48,7 +50,7 @@ class Client:
     def call(self,method,params):
         self.ident+=1;ident=self.ident;self.send({'id':ident,'method':method,'params':params})
         while True:
-            try:d=self.events.get(timeout=30)
+            try:d=self.responses.get(timeout=30)
             except queue.Empty:raise RuntimeError('app-server did not respond; process exit '+str(self.p.poll()))
             if d.get('id')==ident:
                 if 'error' in d:raise RuntimeError(str(d['error']))
@@ -58,15 +60,23 @@ class Client:
         if queued:
             import uuid
             item=self.call('thread/queue/add',dict(params,clientUserMessageId=str(uuid.uuid4())))['queuedSubmission']
-            self.call('thread/queue/start',{'threadId':thread,'queuedSubmissionId':item['id']})
+            # The production queue automatically dispatches when the thread is idle.
         else:
             self.call('turn/start',params)
-        text='';items=[]
+        return self.wait_turn(thread)
+
+    def wait_turn(self,thread):
+        text='';items=[];settings=[]
         until=time.monotonic()+180
         while time.monotonic()<until:
             d=self.events.get(timeout=max(.1,until-time.monotonic()))
+            if d.get('params',{}).get('threadId') not in (None,thread):continue
+            if d.get('method')=='warning' and d['params'].get('message','').startswith('qpool 排队已暂停'):
+                raise RuntimeError(d['params']['message'])
             if d.get('method')=='item/agentMessage/delta':text+=d['params']['delta']
             if d.get('method')=='item/completed':items.append(d['params']['item'].get('type'))
+            if d.get('method')=='thread/settings/updated':
+                s=d['params']['threadSettings'];settings.append({'model':s['model'],'effort':s.get('effort')})
             if d.get('method')=='error':
                 error=d['params'].get('error',{})
                 message=d['params'].get('message') or error.get('message') or 'turn error'
@@ -78,7 +88,8 @@ class Client:
                 if status!='completed':
                     error=d['params']['turn'].get('error') or {}
                     raise RuntimeError('turn '+status+': '+str(error.get('message','')))
-                return {'status':status,'text':text,'item_types':items}
+                return {'status':status,'text':text,'item_types':items,'settings_notifications':settings,
+                        'turn_id':d['params']['turn']['id']}
         raise RuntimeError('turn deadline exceeded')
     def close(self):
         self.p.terminate()

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import tempfile
 import unittest
 import uuid
 from unittest.mock import patch
@@ -259,34 +260,168 @@ class ProxyTests(unittest.TestCase):
             result = proxy.prepare_turn({'threadId': 't', 'input': [{'type': 'text', 'text': 'hello'}]})
         self.assertEqual('sol', result['model'])
 
-    def test_queued_start_routes_once_and_preserves_user_message_identity(self):
+    def queued_proxy(self):
+        from qp.control_queue import StoredQueue
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = StoredQueue(temp.name, 'test-subject')
         proxy = self.proxy()
+        proxy.output = io.StringIO()
+        proxy.queue_store = lambda: store
+        item = store.operate('add', {'threadId': 't', 'clientUserMessageId': 'user-id',
+                                    'input': [{'type': 'text', 'text': 'task'}]})['queuedSubmission']
+        return proxy, store, {'threadId': 't', 'queuedSubmissionId': item['id']}
+
+    def test_queued_start_routes_once_and_preserves_user_message_identity(self):
+        proxy, store, params = self.queued_proxy()
         calls = []
         result = {'turn': {'id': 'turn-1'}}
-        def rpc(method, params):
-            calls.append((method, params))
+        def rpc(method, data):
+            calls.append((method, data))
             if method == 'thread/read':
                 return {'thread': {'status': {'type': 'idle'}}}
             if method == 'thread/queue/list':
-                return {'data': [{'id': 'q', 'clientUserMessageId': 'user-id', 'input': [{'type': 'text', 'text': 'task'}]}]}
-            if method == 'turn/start':
-                return result
-            return {}
+                return {'data': []}
+            return result
         proxy.rpc = rpc
-        proxy.prepare_turn = lambda p: dict(p, model='astra')
-        with patch('qp.control_proxy.api', return_value={'claimed': False}) as api:
-            self.assertEqual(result, proxy.start_queued({'threadId': 't', 'queuedSubmissionId': 'q'}))
-        turn = next(p for m, p in calls if m == 'turn/start')
-        self.assertEqual('astra', turn['model'])
-        self.assertEqual('user-id', turn['clientUserMessageId'])
-        self.assertEqual(['lookup', 'claim', 'accepted'], [c.args[2].get('action', 'lookup') for c in api.call_args_list])
+        proxy.prepare_turn = lambda p, **kwargs: dict(p, model='astra')
+        self.assertEqual(result, proxy.start_queued(params))
+        self.assertEqual(result, proxy.start_queued(params))  # Durable accepted retry.
+        starts = [p for m, p in calls if m == 'turn/start']
+        self.assertEqual(1, len(starts))
+        self.assertEqual('astra', starts[0]['model'])
+        self.assertEqual('user-id', starts[0]['clientUserMessageId'])
+        self.assertEqual([], store.operate('list', params)['data'])
 
-    def test_accepted_queue_retry_returns_success_even_if_already_deleted(self):
-        proxy = self.proxy()
-        proxy.rpc = lambda *args: (_ for _ in ()).throw(RpcError({'code': -32600, 'message': 'not found'}))
+    def test_accepted_queue_retry_returns_success_even_if_engine_unavailable(self):
+        proxy, store, params = self.queued_proxy()
         result = {'turn': {'id': 'already-accepted'}}
-        with patch('qp.control_proxy.api', return_value={'claimed': True, 'result': result}):
-            self.assertEqual(result, proxy.start_queued({'threadId': 't', 'queuedSubmissionId': 'q'}))
+        store.operate('claim', params)
+        store.operate('accepted', dict(params, result=result))
+        proxy.rpc = lambda *args: (_ for _ in ()).throw(RpcError({'code': -32600, 'message': 'not found'}))
+        self.assertEqual(result, proxy.start_queued(params))
+
+    def test_queue_unknown_dispatch_is_not_replayed_after_reopen(self):
+        from qp.control_proxy import RpcDisconnected
+        from qp.control_queue import StoredQueue
+        proxy, store, params = self.queued_proxy()
+        proxy.idle_for_queue = lambda _: True
+        proxy.prepare_turn = lambda p, **kwargs: p
+        proxy.rpc = lambda *a: (_ for _ in ()).throw(RpcDisconnected('disconnected'))
+        with self.assertRaises(RpcDisconnected):
+            proxy.start_queued(params)
+        reopened = StoredQueue(store.path.parent, 'test-subject')
+        self.assertIsNone(reopened.operate('peek', params))
+        with self.assertRaisesRegex(CollectorError, '未确认'):
+            reopened.operate('claim', params)
+        second = reopened.operate('add', {'threadId': 't', 'clientUserMessageId': 'next',
+            'input': [{'type': 'text', 'text': 'next'}]})['queuedSubmission']
+        with self.assertRaisesRegex(CollectorError, '越序'):
+            reopened.operate('claim', dict(params, queuedSubmissionId=second['id']))
+
+    def test_queue_crud_persists_and_isolates_identity(self):
+        from qp.control_queue import StoredQueue
+        proxy, store, params = self.queued_proxy()
+        second = store.operate('add', {'threadId': 't', 'clientUserMessageId': 'second',
+                                      'input': [{'type': 'text', 'text': 'second'}]})['queuedSubmission']
+        inputs = [{'type': 'text', 'text': 'edited'}]
+        store.operate('update', dict(params, input=inputs))
+        ids = [second['id'], params['queuedSubmissionId']]
+        store.operate('reorder', {'threadId': 't', 'queuedSubmissionIds': ids})
+        reopened = StoredQueue(store.path.parent, 'test-subject')
+        first = reopened.operate('list', {'threadId': 't', 'limit': 1})
+        self.assertEqual(second['id'], first['data'][0]['id'])
+        last = reopened.operate('list', {'threadId': 't', 'cursor': first['nextCursor']})
+        self.assertEqual(inputs, last['data'][0]['input'])
+        self.assertTrue(reopened.operate('delete', params)['deleted'])
+        self.assertFalse(reopened.operate('delete', params)['deleted'])
+        with self.assertRaisesRegex(CollectorError, '登录已变化'):
+            StoredQueue(store.path.parent, 'other-subject').operate('list', {'threadId': 't'})
+
+    def test_old_native_queue_blocks_managed_dispatch(self):
+        proxy, store, params = self.queued_proxy()
+        proxy.rpc = lambda method, data: ({'data': [{'id': 'native-old'}]} if method == 'thread/queue/list'
+                                         else {'thread': {'status': {'type': 'idle'}}})
+        self.assertIsNone(proxy.start_queued(params, automatic=True))
+        self.assertIsNotNone(store.operate('peek', params))
+
+    def test_explicit_queue_rejection_requires_manual_retry(self):
+        proxy, store, params = self.queued_proxy()
+        proxy.idle_for_queue = lambda _: True
+        proxy.prepare_turn = lambda p, **kwargs: p
+        proxy.rpc = lambda *a: (_ for _ in ()).throw(RpcError({'code': -32600, 'message': 'rejected'}))
+        with self.assertRaises(RpcError):
+            proxy.start_queued(params)
+        self.assertIsNone(store.operate('peek', params))
+        self.assertEqual(1, len(store.operate('list', params)['data']))
+        store.operate('claim', params)  # Explicit user retry is allowed.
+
+    def test_settings_are_published_before_turn_without_changing_permissions(self):
+        proxy = self.proxy()
+        original = proxy.rpc
+        calls = []
+        proxy.rpc = lambda m, p: (calls.append((m, p)), original(m, p))[1]
+        with patch('qp.control_proxy.api', return_value={'token': 'plan', 'model': 'astra', 'effort': 'low'}):
+            prepared = proxy.prepare_turn({'threadId': 't', 'input': [{'type': 'text', 'text': 'task'}],
+                                          'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'readOnly'}})
+        update = [p for m, p in calls if m == 'thread/settings/update']
+        self.assertEqual([{'threadId': 't', 'model': 'astra', 'effort': 'low'}], update)
+        self.assertEqual('never', prepared['approvalPolicy'])
+        self.assertEqual({'type': 'readOnly'}, prepared['sandboxPolicy'])
+
+    def test_queue_becoming_active_during_prepare_is_deferred_not_steered(self):
+        proxy, store, params = self.queued_proxy()
+        reads = []
+        calls = []
+        def rpc(method, data):
+            calls.append(method)
+            if method == 'thread/queue/list':
+                return {'data': []}
+            reads.append(1)
+            return {'thread': {'status': {'type': 'idle' if len(reads) == 1 else 'active'}}}
+        proxy.rpc = rpc
+        self.assertIsNone(proxy.start_queued(params, automatic=True))
+        self.assertNotIn('turn/start', calls)
+        self.assertIsNotNone(store.operate('peek', params))
+
+    def test_invalid_crud_does_not_change_queue_head(self):
+        proxy, store, params = self.queued_proxy()
+        before = store.operate('list', params)
+        for action in ('delete', 'update'):
+            with self.assertRaises(CollectorError):
+                store.operate(action, {'threadId': 't', 'input': [{'type': 'text', 'text': 'bad'}]})
+        self.assertEqual(before, store.operate('list', params))
+
+    def test_accepted_turn_blocks_queue_before_native_started_event(self):
+        proxy = self.proxy()
+        proxy.rpc = lambda *a: {'turn': {'id': 'accepted'}}
+        proxy.submit_turn({'threadId': 't'})
+        self.assertFalse(proxy.idle_for_queue('t'))
+
+    def test_native_settings_replayed_after_desktop_optimistic_turn_event(self):
+        from types import SimpleNamespace
+        settings = {'method': 'thread/settings/updated', 'params': {'threadId': 't',
+                    'threadSettings': {'model': 'astra', 'approvalPolicy': 'never',
+                                       'collaborationMode': {'mode': 'plan'}}}}
+        started = {'method': 'turn/started', 'params': {'threadId': 't', 'turn': {'id': 'turn-1'}}}
+        output = io.StringIO()
+        proxy = Proxy(SimpleNamespace(stdout=io.StringIO('\n'.join(json.dumps(x) for x in [settings, started]))),
+                      '/tmp/unused', output=output)
+        proxy.read()
+        self.assertEqual([settings, started, settings], [json.loads(x) for x in output.getvalue().splitlines()])
+
+    def test_automatic_queue_failure_uses_thread_warning_without_fake_turn(self):
+        proxy = self.proxy()
+        proxy.output = io.StringIO()
+        done = threading.Event()
+        proxy.start_queued = lambda *a, **k: (_ for _ in ()).throw(CollectorError('unavailable'))
+        emit = proxy.emit
+        proxy.emit = lambda event: (emit(event), done.set())
+        proxy.schedule_queue('t')
+        self.assertTrue(done.wait(2))
+        value = json.loads(proxy.output.getvalue())
+        self.assertEqual('warning', value['method'])
+        self.assertEqual({'threadId', 'message'}, set(value['params']))
 
     def test_child_exit_closes_proxy_without_waiting_for_desktop_input(self):
         child = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE,

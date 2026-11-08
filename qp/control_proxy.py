@@ -1,6 +1,7 @@
 """Transparent stdio App Server proxy, with routing before turn/start.
 
-All permissions, tools, approvals and notifications remain owned by Codex.
+Permissions, tools and approvals remain owned by Codex. Follow-ups are stored
+locally and dispatched through the same model-selection path as direct input.
 Private RPC ids never escape to the desktop. No prompts or credentials are logged.
 """
 import copy
@@ -27,6 +28,10 @@ class RpcError(CollectorError):
 
 
 class RpcDisconnected(CollectorError):
+    pass
+
+
+class QueueBusy(CollectorError):
     pass
 
 
@@ -105,6 +110,10 @@ class Proxy:
         self.pending = {}
         self.counter = 0
         self.thread_locks = {}
+        self.queue_workers = {}
+        self.queue_wakes = set()
+        self.active_turns = {}
+        self.thread_settings = {}
         self.workers = []
         self.closed = threading.Event()
 
@@ -152,7 +161,30 @@ class Proxy:
                         pending.put(value)
                     # Late private RPC responses must not collide with desktop ids.
                 else:
+                    method, params = value.get('method'), value.get('params', {})
+                    if method == 'thread/settings/updated':
+                        self.thread_settings[params['threadId']] = value
+                    if method in ('turn/started', 'turn/completed'):
+                        with self.pending_lock:
+                            thread = params.get('threadId')
+                            turn = params.get('turn', {}).get('id')
+                            if method == 'turn/started':
+                                self.active_turns[thread] = turn
+                            elif self.active_turns.get(thread) in (turn, 'pending'):
+                                self.active_turns.pop(thread, None)
                     self.emit(value)
+                    if method == 'turn/started':
+                        # The desktop reapplies its optimistic (pre-routing)
+                        # model on turn/started. Replay the engine's authoritative
+                        # settings after that event; do not mutate engine settings
+                        # or synthesize permissions/collaboration fields.
+                        settings = self.thread_settings.get(params.get('threadId'))
+                        if settings:
+                            self.emit(settings)
+                    if value.get('method') == 'turn/completed' or (
+                            value.get('method') == 'thread/status/changed' and
+                            value['params'].get('status', {}).get('type') == 'idle'):
+                        self.schedule_queue(value['params'].get('threadId'))
         finally:
             self.closed.set()
             with self.pending_lock:
@@ -162,10 +194,14 @@ class Proxy:
                     except queue.Full:
                         pass
 
-    def prepare_turn(self, params):
+    def prepare_turn(self, params, require_idle=False):
         thread = params['threadId']
         snapshot = self.rpc('thread/read', {'threadId': thread, 'includeTurns': False})['thread']
-        if snapshot.get('status', {}).get('type') == 'active':
+        with self.pending_lock:
+            active = thread in self.active_turns
+        if active or snapshot.get('status', {}).get('type') == 'active':
+            if require_idle:
+                raise QueueBusy('上一轮尚未结束，排队消息继续等待')
             # turn/start on an active thread is steering, not a new model boundary.
             params = dict(params)
             for key in ('model', 'effort', 'collaborationMode', 'responsesapiClientMetadata',
@@ -197,55 +233,119 @@ class Proxy:
         patch = params.get('responsesapiClientMetadataPatch') or {}
         params['responsesapiClientMetadataPatch'] = patch
         patch[METADATA_KEY] = plan['token']
+        # Publish the same native settings the turn will use. turn/start alone
+        # changes execution but does not notify the desktop model picker.
+        update = {'threadId': thread, 'model': plan['model'], 'effort': plan['effort']}
+        if params.get('collaborationMode'):
+            update['collaborationMode'] = params['collaborationMode']
+        self.rpc('thread/settings/update', update)
         return params
 
-    def start_queued(self, params):
-        thread = params['threadId']
-        queued_id = params.get('queuedSubmissionId')
-        claim = {'threadId': thread, 'queuedSubmissionId': queued_id}
-        if queued_id:
-            old = api(self.root, 'queue', claim)
-            if old['claimed']:
-                if old['result']:
-                    try:
-                        self.rpc('thread/queue/delete', claim)
-                    except (CollectorError, OSError):
-                        pass  # Already accepted; cleanup cannot turn it into failure.
-                    return old['result']
-                raise CollectorError('该排队消息的提交结果未确认；请检查聊天后删除或重新发送，未自动重放')
+    def queue_store(self):
+        from hashlib import sha256
+        from .control_queue import StoredQueue
+        state = desktop.read_state(self.root)
+        login = read_login(Path(state['config_path']).parent / 'auth.json')
+        return StoredQueue(self.root, sha256(login['account_id'].encode()).hexdigest())
+
+    def idle_for_queue(self, thread):
+        # Do not copy or delete old native queued work: its internal worker can
+        # consume it concurrently. Let it drain before dispatching managed work.
+        with self.pending_lock:
+            if thread in self.active_turns:
+                return False
+        native_queue = self.rpc('thread/queue/list', {'threadId': thread, 'limit': 1})
         snapshot = self.rpc('thread/read', {'threadId': thread, 'includeTurns': False})['thread']
-        if snapshot.get('status', {}).get('type') == 'active':
-            raise CollectorError('当前回复尚未结束，排队消息保持等待')
-        cursor = None
-        selected = None
-        while True:
-            page = self.rpc('thread/queue/list', {'threadId': thread, 'limit': 100, 'cursor': cursor})
-            selected = next((q for q in page['data'] if not queued_id or q['id'] == queued_id), None)
-            cursor = page.get('nextCursor')
-            if selected or not cursor:
-                break
-        if not selected:
-            raise CollectorError('未找到排队消息')
-        claim['queuedSubmissionId'] = selected['id']
-        prepared = self.prepare_turn({'threadId': thread, 'input': selected['input'],
-                                     'clientUserMessageId': selected['clientUserMessageId']})
-        api(self.root, 'queue', dict(claim, action='claim'))
+        with self.pending_lock:
+            return (thread not in self.active_turns and not native_queue['data'] and
+                    snapshot.get('status', {}).get('type') == 'idle')
+
+    def submit_turn(self, params):
+        thread = params['threadId']
+        # Acceptance can precede thread/status/changed. Close that interval so
+        # a queued follow-up cannot accidentally become active-turn steering.
+        with self.pending_lock:
+            self.active_turns.setdefault(thread, 'pending')
         try:
-            result = self.rpc('turn/start', prepared)
+            return self.rpc('turn/start', params)
         except RpcError:
-            api(self.root, 'queue', dict(claim, action='rejected'))
+            with self.pending_lock:
+                if self.active_turns.get(thread) == 'pending':
+                    self.active_turns.pop(thread, None)
             raise
-        # Once Codex accepts the turn, return success even if bookkeeping fails.
-        # The durable pending claim prevents another process from replaying it.
+
+    def start_queued(self, params, automatic=False):
+        store = self.queue_store()
+        if automatic:
+            selected = store.operate('peek', params)
+            if not selected:
+                return None
+            params = dict(params, queuedSubmissionId=selected['id'])
+        previous = store.operate('lookup', params)
+        if previous:
+            return previous
+        if not self.idle_for_queue(params['threadId']):
+            if automatic:
+                return None
+            raise CollectorError('当前回复或原生旧队列尚未结束，排队消息保持等待')
+        claim = store.operate('claim', params)
+        if 'result' in claim:
+            return claim['result']
+        selected = claim['item']
+        params = dict(params, queuedSubmissionId=selected['id'])
+        # Preparation cannot start a turn. A failure here is safe for an explicit
+        # retry; only an uncertain turn/start must retain the durable claim.
         try:
-            api(self.root, 'queue', dict(claim, action='accepted', result=result))
+            prepared = self.prepare_turn({'threadId': params['threadId'], 'input': selected['input'],
+                                         'clientUserMessageId': selected['clientUserMessageId']}, require_idle=True)
+        except QueueBusy:
+            store.operate('deferred', params)
+            if automatic:
+                return None
+            raise
+        except (CollectorError, OSError, ValueError, KeyError, TypeError):
+            store.operate('rejected', params)
+            raise
+        try:
+            result = self.submit_turn(prepared)
+        except RpcError:
+            store.operate('rejected', params)
+            raise
+        try:
+            store.operate('accepted', dict(params, result=result))
         except (CollectorError, OSError, ValueError):
             print('qpool: 排队消息已提交，确认记录未完成；不会自动重发。', file=sys.stderr)
-        try:
-            self.rpc('thread/queue/delete', claim)
-        except (CollectorError, OSError):
-            print('qpool: 排队消息已提交，待清除队列记录。', file=sys.stderr)
+        self.emit({'method': 'thread/queue/changed', 'params': {'threadId': params['threadId']}})
         return result
+
+    def schedule_queue(self, thread):
+        if not thread or self.closed.is_set():
+            return
+        with self.pending_lock:
+            self.queue_wakes.add(thread)
+            if thread in self.queue_workers:
+                return
+            lock = self.thread_locks.setdefault(thread, threading.Lock())
+            def drain():
+                while not self.closed.is_set():
+                    with self.pending_lock:
+                        self.queue_wakes.discard(thread)
+                    try:
+                        with lock:
+                            self.start_queued({'threadId': thread}, automatic=True)
+                    except (CollectorError, OSError, ValueError, KeyError, TypeError) as exc:
+                        # Keep the input visible. Failed/unknown items stop the
+                        # queue until the user explicitly retries or deletes it.
+                        message = str(exc) if isinstance(exc, CollectorError) else '排队消息未提交，请检查本地状态'
+                        self.emit({'method': 'warning', 'params': {'threadId': thread,
+                                   'message': 'qpool 排队已暂停：' + message}})
+                    with self.pending_lock:
+                        if thread not in self.queue_wakes:
+                            self.queue_workers.pop(thread, None)
+                            return
+            worker = threading.Thread(target=drain, daemon=True)
+            self.queue_workers[thread] = worker
+            worker.start()
 
     def request(self, message):
         ident, method = message['id'], message['method']
@@ -253,15 +353,25 @@ class Proxy:
         thread = params.get('threadId')
         lock = None
         try:
-            if method == 'turn/start' or method.startswith('thread/queue/'):
+            if method in ('turn/start', 'thread/settings/update') or method.startswith('thread/queue/'):
                 with self.pending_lock:
                     lock = self.thread_locks.setdefault(thread, threading.Lock())
-                if not lock.acquire(blocking=False):
+                if not lock.acquire(timeout=120):
                     lock = None
                     raise CollectorError('此聊天正在准备下一轮，请稍后重试')
                 if method == 'turn/start':
                     params = self.prepare_turn(params)
-            result = self.start_queued(params) if method == 'thread/queue/start' else self.rpc(method, params)
+            if method == 'thread/queue/start':
+                result = self.start_queued(params)
+            elif method == 'turn/start':
+                result = self.submit_turn(params)
+            elif method.startswith('thread/queue/'):
+                # Validate ownership/existence through the real engine before
+                # accepting input into our durable, non-auto-consuming queue.
+                self.rpc('thread/read', {'threadId': thread, 'includeTurns': False})
+                result = self.queue_store().operate(method.rsplit('/', 1)[-1], params)
+            else:
+                result = self.rpc(method, params)
             if method == 'thread/settings/update' and (params.get('model') or params.get('effort')):
                 snapshot = self.rpc('thread/read', {'threadId': thread, 'includeTurns': False})['thread']
                 api(self.root, 'prepare', {'threadId': thread, 'model': params.get('model'),
@@ -269,6 +379,11 @@ class Proxy:
                     'explicit': bool(params.get('model')), 'effortExplicit': bool(params.get('effort')),
                     'preferenceOnly': True, 'currentModel': snapshot.get('model')})
             self.emit({'id': ident, 'result': result})
+            if method.startswith('thread/queue/') and method != 'thread/queue/list':
+                self.emit({'method': 'thread/queue/changed', 'params': {'threadId': thread}})
+                self.schedule_queue(thread)
+            elif method == 'thread/resume':
+                self.schedule_queue(result['thread']['id'])
         except RpcError as exc:
             self.emit({'id': ident, 'error': exc.error})
         except (CollectorError, OSError, ValueError, KeyError, TypeError) as exc:
@@ -315,6 +430,8 @@ class Proxy:
                 self.process.wait()
             reader.join(timeout=3)
             for worker in self.workers:
+                worker.join(timeout=1)
+            for worker in list(self.queue_workers.values()):
                 worker.join(timeout=1)
 
 

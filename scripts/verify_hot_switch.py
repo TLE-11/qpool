@@ -237,6 +237,7 @@ def main():
                     {'type': 'message', 'role': 'user', 'content': [
                         {'type': 'input_text', 'text': 'Irrelevant test padding; retain the earlier HOT_SWITCH marker. ' + filler}]}]})
             before = len(receipts(tid))
+            previous_model = client.call('thread/read', {'threadId': tid})['thread']['model']
             queued = args.control_queued and mode == 'qpool'
             response = client.turn(tid, prompt, queued=queued)
             rows = receipts(tid)[before:]
@@ -251,6 +252,9 @@ def main():
                 configured = client.call('thread/read', {'threadId': tid, 'includeTurns': False})['thread']['model']
                 row['codex_configured_model'] = configured
                 assert configured == expected_model, 'Codex did not adopt routed model'
+                row['settings_notifications'] = response['settings_notifications']
+                if previous_model != expected_model:
+                    assert response['settings_notifications'] and response['settings_notifications'][-1]['model'] == expected_model, 'desktop model notification missing'
             execution_rows = rows
             if args.control_compact and label == 'upgraded-next-turn-qpool':
                 assert rows[0]['entry_mode'] == 'native' and rows[0]['model'] == 'gpt-6.1-sol'
@@ -277,6 +281,50 @@ def main():
             turn('legacy', 'native', 'upgraded-next-turn-native')
         else:
             run_round_trips(turn)
+        if args.control_queued:
+            import uuid
+            key = 'legacy' if args.legacy_upgrade else 'native'
+            client, tid = clients[key], threads[key]
+            api(root, '/api/desktop/mode', {'mode': 'native'})
+            before = len(receipts(tid))
+            client.call('turn/start', {'threadId': tid, 'input': [{'type': 'text', 'text':
+                'Use a terminal tool to run python3 -c "import time; time.sleep(8); print(123)". '
+                'Wait for the tool to finish, then reply only QUEUE_GATE. Do not modify files.'}]})
+            def enqueue(suffix):
+                inputs = [{'type': 'text', 'text': 'Reply only with the earlier HOT_SWITCH marker followed by ' + suffix}]
+                return client.call('thread/queue/add', {'threadId': tid, 'input': inputs,
+                    'clientUserMessageId': str(uuid.uuid4())})['queuedSubmission']
+            a, b, deleted = enqueue('QUEUE_A'), enqueue('QUEUE_B'), enqueue('SHOULD_NOT_RUN')
+            client.call('thread/queue/update', {'threadId': tid, 'queuedSubmissionId': a['id'],
+                'input': [{'type': 'text', 'text': 'Reply only with the earlier HOT_SWITCH marker followed by QUEUE_EDITED'}]})
+            client.call('thread/queue/reorder', {'threadId': tid,
+                'queuedSubmissionIds': [b['id'], a['id'], deleted['id']]})
+            client.call('thread/queue/delete', {'threadId': tid, 'queuedSubmissionId': deleted['id']})
+            pending = client.call('thread/queue/list', {'threadId': tid})['data']
+            assert [i['id'] for i in pending] == [b['id'], a['id']], 'follow-ups did not wait behind the running turn'
+            api(root, '/api/desktop/mode', {'mode': 'qpool'})
+            responses = [client.wait_turn(tid) for _ in range(3)]
+            assert 'QUEUE_GATE' in responses[0]['text'] and 'commandExecution' in responses[0]['item_types']
+            for r, suffix in zip(responses[1:], ['QUEUE_B', 'QUEUE_EDITED']):
+                assert markers[key] in r['text'] and suffix in r['text']
+            assert len({r['turn_id'] for r in responses}) == 3, 'follow-up was steered into another turn'
+            rows = receipts(tid)[before:]
+            assert all(r['status'] == 'completed' for r in rows)
+            # The deliberately tiny catalog can compact repeatedly during the
+            # two follow-ups. Validate the native/pool boundary, not a fixed
+            # number of HTTP requests per turn; turn IDs prove separate inputs.
+            boundary = next(i for i, r in enumerate(rows) if r['actual_model'] == pool_model)
+            assert boundary > 0
+            assert all(r['actual_model'] == 'gpt-6.1-sol' and r['entry_mode'] == 'native' for r in rows[:boundary])
+            assert len(rows[boundary:]) >= 2 and all(r['actual_model'] == pool_model and r['entry_mode'] is None for r in rows[boundary:])
+            if len(rows[boundary:]) > 2:
+                assert any('contextCompaction' in r['item_types'] for r in responses[1:]), 'extra requests require observed compaction'
+            assert not client.call('thread/queue/list', {'threadId': tid})['data']
+            report['queued_while_busy'] = {'passed': True, 'thread_id': tid, 'engine_pid': client.p.pid,
+                'ordered_suffixes': ['QUEUE_GATE', 'QUEUE_B', 'QUEUE_EDITED'], 'deleted_not_run': True,
+                'mode_changed_while_waiting': True, 'turn_ids': [r['turn_id'] for r in responses],
+                'item_types': [r['item_types'] for r in responses], 'receipts': rows}
+            print(json.dumps(report['queued_while_busy'], ensure_ascii=False), flush=True)
         report['config_unchanged_during_switches'] = hashlib.sha256((home / 'config.toml').read_bytes()).hexdigest() == config_hash
     finally:
         for client in clients.values():
